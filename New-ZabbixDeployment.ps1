@@ -24,7 +24,10 @@ param(
 
     [string]$PackagePath = (Join-Path $env:ProgramData 'ZabbixDeployment'),
 
-    [string]$AgentUnc = '\\gas-fil004\packages\Zabbix Agent 2\zabbix_agent2-7.0.32-windows-amd64-openssl.msi',
+    [ValidatePattern('^\d+\.\d+\.\d+$')]
+    [string]$ZabbixAgentVersion = '7.0.32',
+
+    [string]$AgentUnc = "\\gas-fil004\packages\Zabbix Agent 2\zabbix_agent2-$ZabbixAgentVersion-windows-amd64-openssl.msi",
 
     [Security.SecureString]$PskSecret,
 
@@ -102,6 +105,7 @@ if ($null -ne $PskSecret) {
 New-Item -ItemType Directory -Path $PackagePath | Out-Null
 # Replace inherited access before writing any package configuration or secrets.
 $Acl = New-Object Security.AccessControl.DirectorySecurity
+$Acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
 $Acl.SetAccessRuleProtection($true, $false)
 foreach ($Account in @($Administrators, $System)) {
     $Acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
@@ -113,7 +117,7 @@ foreach ($Sid in $ReaderSids) {
 }
 Set-Acl -LiteralPath $PackagePath -AclObject $Acl
 
-$MsiName = 'zabbix_agent2-7.0.32-windows-amd64-openssl.msi'
+$MsiName = "zabbix_agent2-$ZabbixAgentVersion-windows-amd64-openssl.msi"
 $MsiPath = Join-Path $PackagePath $MsiName
 $MsiUrl = "https://github.com/killo431/packages/releases/download/main/$MsiName"
 $MsiCopied = $false
@@ -144,6 +148,27 @@ $Signature = Get-AuthenticodeSignature -LiteralPath $MsiPath
 if ($Signature.Status -ne 'Valid' -or $Signature.SignerCertificate.Subject -notmatch 'O="?Zabbix SIA"?(,|$)') {
     throw 'The MSI must have a valid Zabbix SIA Authenticode signature. The deployment share has not been created.'
 }
+function Get-MsiProductVersion {
+    param([string]$Path)
+    $WindowsInstaller = New-Object -ComObject WindowsInstaller.Installer
+    $Database = $WindowsInstaller.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $WindowsInstaller, @($Path, 0))
+    $View = $Database.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $Database, @("SELECT Value FROM Property WHERE Property='ProductVersion'"))
+    try {
+        $View.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $View, $null) | Out-Null
+        $Record = $View.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $View, $null)
+        if ($null -eq $Record) { return $null }
+        $Record.GetType().InvokeMember('StringData', 'GetProperty', $null, $Record, 1)
+    } finally {
+        $View.GetType().InvokeMember('Close', 'InvokeMethod', $null, $View, $null) | Out-Null
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($View)
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($Database)
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($WindowsInstaller)
+    }
+}
+$MsiProductVersion = [string](Get-MsiProductVersion -Path $MsiPath)
+if ($MsiProductVersion -notmatch '^(\d+\.\d+\.\d+)' -or [version]$Matches[1] -ne [version]$ZabbixAgentVersion) {
+    throw "The MSI reports ProductVersion '$MsiProductVersion', not $ZabbixAgentVersion. The deployment share has not been created."
+}
 Copy-Item -LiteralPath $InstallerPath -Destination $PackagePath
 $PackagedLldScript = ''
 if ($LldScript) {
@@ -161,6 +186,7 @@ $Configuration = [ordered]@{
     DefaultPskId = $DefaultPskId
     LldScript = $PackagedLldScript
     ConfPath = $ConfPath
+    ZabbixAgentVersion = $ZabbixAgentVersion
     ZabbixInstallationMSI = $MsiName
     MsiSha256 = (Get-FileHash -LiteralPath $MsiPath -Algorithm SHA256).Hash
 }

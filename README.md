@@ -23,7 +23,10 @@ It refuses to overwrite an existing directory or share. The primary MSI source
 is `\\gas-fil004\packages\Zabbix Agent 2\zabbix_agent2-7.0.32-windows-amd64-openssl.msi`,
 matching the original deployment script; use `-AgentUnc` to select another source.
 The runner copies from this share first and uses the GitHub download only if
-copying fails or the source is missing/inaccessible.
+copying fails or the source is missing/inaccessible. Use `-ZabbixAgentVersion`
+to package a different agent release; the MSI file name, default UNC path, and
+download URL follow it, and the runner refuses an MSI whose internal
+ProductVersion does not match. The version is recorded in `deployment.json`.
 
 `ServerActive` defaults to `DefaultServer` when omitted. `HostMetadata` defaults
 to `GAS;windows;ADC;server`; use `GAS;windows;ADC;sql` for SQL servers. Choose
@@ -77,6 +80,26 @@ Use `install_agent2_gpo.ps1` as a computer startup PowerShell script:
 3. Link the GPO to the target computers' OU.
 
 The MSI runs quietly. Installation/configuration errors are raised by the script.
+
+### Client-side behavior and logs
+
+- **Logs:** each run appends to `%ProgramData%\ZabbixAgent2\logs\install.log`
+  (rotated at 1 MB), and every MSI run writes a verbose
+  `msiexec-<timestamp>.log` beside it. PSK values are never logged.
+- **Secured working directory:** `%ProgramData%\ZabbixAgent2` (PSK file, logs,
+  MSI staging) is reset on every run so only SYSTEM and Administrators can
+  access it. If that directory exists but is owned by anyone other than
+  SYSTEM, Administrators, or TrustedInstaller, or is a junction, the installer
+  stops: a standard user may have created it in advance. Inspect and delete it,
+  then let the startup script run again.
+- **MSI staging:** the MSI is copied or downloaded into a new, per-run folder
+  inside that directory (not `%TEMP%`), verified, installed, and deleted.
+- **Installed version detection** reads the Windows Uninstall registry keys
+  instead of `Win32_Product`.
+- **Busy installer:** exit code 1618 (another installation in progress) is
+  retried up to five times, 60 seconds apart.
+- **Service restart:** the agent service is located by its `zabbix_agent2.exe`
+  path rather than by name.
 
 ## Automatic agent configuration check
 
