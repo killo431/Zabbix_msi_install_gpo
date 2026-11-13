@@ -85,6 +85,9 @@ try {
     $ConfigPath = Join-Path $TestRoot 'deployment.json'
     $Package = @{
         DefaultServer = 'zabbix.example.com'
+        ServerActive = 'zabbix-proxy.example.com'
+        HostMetadata = 'GAS;windows;ADC;server'
+        HostnameMode = 'FQDN'
         PskSecret = ''
         DefaultPskId = ''
         LldScript = 'lld.ps1'
@@ -103,7 +106,11 @@ try {
     Assert-True ($TestState.DownloadCalls -eq 0) 'A reachable shared MSI must not trigger a download.'
     Assert-True ($TestState.MsiArguments.Contains('/qn')) 'MSI installation must be quiet.'
     Assert-True ($TestState.MsiArguments.Contains('/norestart')) 'MSI installation must not trigger an automatic reboot.'
+    Assert-True ($TestState.MsiArguments.Contains('SERVERACTIVE=zabbix-proxy.example.com')) 'The active server must be passed to the MSI.'
     Assert-True ((Get-Content $TestState.AgentConfig) -contains 'Server=zabbix.example.com') 'The package server must be applied.'
+    Assert-True ((Get-Content $TestState.AgentConfig) -contains 'ServerActive=zabbix-proxy.example.com') 'The active server must be written to the agent config.'
+    Assert-True ((Get-Content $TestState.AgentConfig) -contains 'HostMetadata=GAS;windows;ADC;server') 'The GAS metadata must be written to the agent config.'
+    Assert-True ((Get-Content $TestState.AgentConfig) -contains 'Hostname=testhost.example.com') 'The FQDN hostname mode must use the computer FQDN.'
     Assert-True (Test-Path (Join-Path $TestRoot 'scripts/lld.ps1')) 'The packaged LLD script must be copied.'
     Assert-True ($TestState.RestartCalls -eq 1) 'Configuration changes must restart the agent.'
 
@@ -111,6 +118,14 @@ try {
     & $Installer -ConfigPath $ConfigPath
     Assert-True ($TestState.InstallCalls -eq 1) 'An up-to-date client must not reinstall the MSI.'
     Assert-True ($TestState.RestartCalls -eq 1) 'Unchanged configuration must not restart the agent.'
+
+    $Package.HostnameMode = 'GAS'
+    $Package.HostMetadata = 'GAS;windows;ADC;sql'
+    Save-Package
+    & $Installer -ConfigPath $ConfigPath
+    Assert-True ((Get-Content $TestState.AgentConfig) -contains 'Hostname=GAS-testhost') 'GAS hostname mode must use the GAS-prefixed computer name.'
+    Assert-True ((Get-Content $TestState.AgentConfig) -contains 'HostMetadata=GAS;windows;ADC;sql') 'SQL packages must apply their configured metadata.'
+    Assert-True ($TestState.RestartCalls -eq 2) 'Changed metadata must restart the agent.'
 
     $BuilderAst = [Management.Automation.Language.Parser]::ParseFile(
         (Join-Path $Repository 'New-ZabbixDeployment.ps1'), [ref]$null, [ref]$null)

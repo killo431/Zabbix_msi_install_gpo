@@ -9,9 +9,12 @@ param(
 # User-configurable variables
 $ZabbixMsiUrl = "https://github.com/killo431/packages/releases/download/main/zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
 $ZabbixAgentVersion = "7.0.32"
+$ServerActive = ""
+$HostMetadata = "GAS;windows;ADC;server"
+$HostnameMode = "FQDN"
 $PskSecret = ""
 $DefaultPskId = ""
-$DefaultServer = ""
+$DefaultServer = "172.17.6.24"
 $LldScript = ""
 $ConfPath = "C:\Program Files\Zabbix Agent 2\zabbix_agent2.conf"
 $AgentUnc = "\\gas-fil004\packages\Zabbix Agent 2\zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
@@ -26,12 +29,15 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 }
 if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
     $Package = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    foreach ($Name in @('DefaultServer', 'PskSecret', 'DefaultPskId', 'LldScript', 'ConfPath', 'ZabbixInstallationMSI', 'MsiSha256')) {
+    foreach ($Name in @('DefaultServer', 'ServerActive', 'HostMetadata', 'HostnameMode', 'PskSecret', 'DefaultPskId', 'LldScript', 'ConfPath', 'ZabbixInstallationMSI', 'MsiSha256')) {
         if ($null -eq $Package.PSObject.Properties[$Name] -or $Package.$Name -isnot [string]) {
             throw "Deployment configuration must contain a string value for $Name."
         }
     }
     $DefaultServer = $Package.DefaultServer
+    $ServerActive = $Package.ServerActive
+    $HostMetadata = $Package.HostMetadata
+    $HostnameMode = $Package.HostnameMode
     $PskSecret = $Package.PskSecret
     $DefaultPskId = $Package.DefaultPskId
     $ConfPath = $Package.ConfPath
@@ -48,6 +54,15 @@ if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
 
 if ([string]::IsNullOrWhiteSpace($DefaultServer)) {
     throw "Set DefaultServer to the Zabbix server or proxy address before deployment."
+}
+if ([string]::IsNullOrWhiteSpace($ServerActive)) {
+    $ServerActive = $DefaultServer
+}
+if ([string]::IsNullOrWhiteSpace($HostMetadata) -or $HostMetadata -match '[\r\n"]') {
+    throw "Set HostMetadata to the expected GAS metadata string."
+}
+if ($HostnameMode -notin @('FQDN', 'GAS')) {
+    throw "HostnameMode must be FQDN or GAS."
 }
 if ([string]::IsNullOrWhiteSpace($PskSecret) -xor [string]::IsNullOrWhiteSpace($DefaultPskId)) {
     throw "Set both PskSecret and DefaultPskId, or leave both empty."
@@ -94,7 +109,11 @@ if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
 }
 
 $ComputerSystem = Get-WmiObject -Class Win32_ComputerSystem
-$FQDN = $ComputerSystem.DNSHostName + "." + $ComputerSystem.Domain
+$FQDN = if ($HostnameMode -eq 'GAS') {
+    "GAS-$($ComputerSystem.DNSHostName)"
+} else {
+    $ComputerSystem.DNSHostName + "." + $ComputerSystem.Domain
+}
 
 $ZabbixSoftwareName = "Zabbix Agent 2 (64-bit)"
 $InstalledZabbixVersion = (Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -eq $ZabbixSoftwareName }).Version
@@ -156,7 +175,8 @@ if ($InstallRequired) {
 
     $MsiProperties = @(
         "SERVER=$DefaultServer"
-        "HOSTMETADATA=Windows"
+        "SERVERACTIVE=$ServerActive"
+        "HOSTMETADATA=$HostMetadata"
         "HOSTNAME=$FQDN"
         "LOGFILESIZE=20"
         "DEBUGLEVEL=3"
@@ -186,12 +206,13 @@ if (-not (Test-Path -LiteralPath $ConfPath -PathType Leaf)) {
 
 $Configuration = [ordered]@{
     Server = $DefaultServer
-    HostMetadata = "Windows"
+    ServerActive = $ServerActive
+    HostMetadata = $HostMetadata
     Hostname = $FQDN
     LogFileSize = "20"
     DebugLevel = "3"
 }
-$ManagedPattern = '^\s*#?\s*(Server|HostMetadata|Hostname|LogFileSize|DebugLevel)\s*='
+$ManagedPattern = '^\s*#?\s*(Server|ServerActive|HostMetadata|Hostname|LogFileSize|DebugLevel)\s*='
 $ConfigLines = @(Get-Content -LiteralPath $ConfPath -ErrorAction Stop | Where-Object { $_ -notmatch $ManagedPattern })
 
 if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {

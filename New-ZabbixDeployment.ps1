@@ -7,6 +7,14 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$DefaultServer,
 
+    [string]$ServerActive = $DefaultServer,
+
+    [ValidateNotNullOrEmpty()]
+    [string]$HostMetadata = 'GAS;windows;ADC;server',
+
+    [ValidateSet('FQDN', 'GAS')]
+    [string]$HostnameMode = 'FQDN',
+
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
     [string[]]$ReadAccess,
@@ -38,6 +46,12 @@ if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
 }
 if ([string]::IsNullOrWhiteSpace($DefaultServer) -or $DefaultServer -match '[\r\n"]') {
     throw 'DefaultServer must be a nonempty Zabbix server address without quotes or newlines.'
+}
+if ([string]::IsNullOrWhiteSpace($ServerActive) -or $ServerActive -match '[\r\n"]') {
+    throw 'ServerActive must be a nonempty Zabbix server or proxy address without quotes or newlines.'
+}
+if ($HostMetadata -match '[\r\n"]') {
+    throw 'HostMetadata must not contain quotes or newlines.'
 }
 if (($null -ne $PskSecret) -xor (-not [string]::IsNullOrWhiteSpace($DefaultPskId))) {
     throw 'Supply both PskSecret and DefaultPskId, or omit both.'
@@ -140,6 +154,9 @@ if ($LldScript) {
 }
 $Configuration = [ordered]@{
     DefaultServer = $DefaultServer
+    ServerActive = $ServerActive
+    HostMetadata = $HostMetadata
+    HostnameMode = $HostnameMode
     PskSecret = $PlainPsk
     DefaultPskId = $DefaultPskId
     LldScript = $PackagedLldScript

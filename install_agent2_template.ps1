@@ -9,15 +9,21 @@
 # User-configurable variables
 $ZabbixMsiUrl = "https://github.com/killo431/packages/releases/download/main/zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
 $ZabbixAgentVersion = "7.0.32"
+$ServerActive = ""
+$HostMetadata = "GAS;windows;ADC;server"
+$HostnameMode = "FQDN"
 $AgentUnc = "\\gas-fil004\packages\Zabbix Agent 2\zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
 $PskSecret = ""
 $DefaultPskId = ""
-$DefaultServer = ""
+$DefaultServer = "172.17.6.24"
 $LldScript = ""
 $ConfPath = "C:\Program Files\Zabbix Agent 2\zabbix_agent2.conf"
 
 # Environment overrides allow this file to run through irm | iex without editing it first.
 if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_SERVER)) { $DefaultServer = $env:ZABBIX_SERVER }
+if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_SERVER_ACTIVE)) { $ServerActive = $env:ZABBIX_SERVER_ACTIVE }
+if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_HOST_METADATA)) { $HostMetadata = $env:ZABBIX_HOST_METADATA }
+if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_HOSTNAME_MODE)) { $HostnameMode = $env:ZABBIX_HOSTNAME_MODE }
 if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_PSK_SECRET)) { $PskSecret = $env:ZABBIX_PSK_SECRET }
 if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_PSK_ID)) { $DefaultPskId = $env:ZABBIX_PSK_ID }
 if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_LLD_SCRIPT)) { $LldScript = $env:ZABBIX_LLD_SCRIPT }
@@ -34,6 +40,11 @@ if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 if ([string]::IsNullOrWhiteSpace($DefaultServer)) {
     throw "Set DefaultServer or the ZABBIX_SERVER environment variable to the Zabbix server or proxy address."
 }
+if ([string]::IsNullOrWhiteSpace($ServerActive)) { $ServerActive = $DefaultServer }
+if ([string]::IsNullOrWhiteSpace($HostMetadata) -or $HostMetadata -match '[\r\n"]') {
+    throw "Set HostMetadata to the expected GAS metadata string."
+}
+if ($HostnameMode -notin @('FQDN', 'GAS')) { throw "HostnameMode must be FQDN or GAS." }
 if ([string]::IsNullOrWhiteSpace($PskSecret) -xor [string]::IsNullOrWhiteSpace($DefaultPskId)) {
     throw "Set both PskSecret and DefaultPskId, or leave both empty."
 }
@@ -80,7 +91,11 @@ if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
 
 # Construct the FQDN (Fully Qualified Domain Name) of the local computer
 $ComputerSystem = Get-WmiObject -Class Win32_ComputerSystem
-$FQDN = $ComputerSystem.DNSHostName + "." + $ComputerSystem.Domain
+$FQDN = if ($HostnameMode -eq 'GAS') {
+    "GAS-$($ComputerSystem.DNSHostName)"
+} else {
+    $ComputerSystem.DNSHostName + "." + $ComputerSystem.Domain
+}
 
 $ZabbixSoftwareName = "Zabbix Agent 2 (64-bit)"
 $InstalledZabbixVersion = (Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -eq $ZabbixSoftwareName }).Version
@@ -136,7 +151,8 @@ if ($InstallRequired) {
 
     $MsiProperties = @(
         "SERVER=$DefaultServer"
-        "HOSTMETADATA=Windows"
+        "SERVERACTIVE=$ServerActive"
+        "HOSTMETADATA=$HostMetadata"
         "HOSTNAME=$FQDN"
         "LOGFILESIZE=20"
         "DEBUGLEVEL=3"
@@ -166,12 +182,13 @@ if (-not (Test-Path -LiteralPath $ConfPath -PathType Leaf)) {
 
 $Configuration = [ordered]@{
     Server = $DefaultServer
-    HostMetadata = "Windows"
+    ServerActive = $ServerActive
+    HostMetadata = $HostMetadata
     Hostname = $FQDN
     LogFileSize = "20"
     DebugLevel = "3"
 }
-$ManagedPattern = '^\s*#?\s*(Server|HostMetadata|Hostname|LogFileSize|DebugLevel)\s*='
+$ManagedPattern = '^\s*#?\s*(Server|ServerActive|HostMetadata|Hostname|LogFileSize|DebugLevel)\s*='
 $ConfigLines = @(Get-Content -LiteralPath $ConfPath -ErrorAction Stop | Where-Object { $_ -notmatch $ManagedPattern })
 
 if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {

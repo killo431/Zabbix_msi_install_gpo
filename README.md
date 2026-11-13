@@ -11,6 +11,8 @@ Download or clone this repository to a domain-joined Windows file server. In
 
 ```powershell
 .\New-ZabbixDeployment.ps1 -DefaultServer "zabbix.example.com" `
+    -ServerActive "zbx01.example.com" `
+    -HostMetadata "GAS;windows;ADC;server" `
     -ReadAccess "CONTOSO\Zabbix Deployment Computers"
 ```
 
@@ -22,6 +24,12 @@ is `\\gas-fil004\packages\Zabbix Agent 2\zabbix_agent2-7.0.32-windows-amd64-open
 matching the original deployment script; use `-AgentUnc` to select another source.
 The runner copies from this share first and uses the GitHub download only if
 copying fails or the source is missing/inaccessible.
+
+`ServerActive` defaults to `DefaultServer` when omitted. `HostMetadata` defaults
+to `GAS;windows;ADC;server`; use `GAS;windows;ADC;sql` for SQL servers. Choose
+`-HostnameMode GAS` to advertise `GAS-<computername>` instead of the default
+FQDN. Create role/site-specific packages as needed and ensure each metadata
+value exactly matches the corresponding Zabbix autoregistration regex.
 
 The package contains the signed 7.0.32 MSI, `deployment.json`, the installer,
 and `Start-ZabbixDeployment.ps1`. The runner checks the MSI's Authenticode
@@ -64,7 +72,7 @@ as a new share before the package is complete.
 
 Use `install_agent2_gpo.ps1` as a computer startup PowerShell script:
 
-1. Set `$DefaultServer` to your Zabbix server or proxy address. Optionally set `$PskSecret`, `$DefaultPskId`, `$LldScript`, and `$ConfPath` at the top of the script.
+1. Set `$DefaultServer` and `$ServerActive` to your Zabbix server/proxy addresses. Set `$HostMetadata` to the exact autoregistration metadata string (for example `GAS;windows;ADC;server` or `GAS;windows;ADC;sql`). `$HostnameMode` defaults to FQDN; set it to `GAS` to advertise `GAS-<computername>`. Optionally set `$PskSecret`, `$DefaultPskId`, `$LldScript`, and `$ConfPath`.
 2. In Group Policy Management, add the script under **Computer Configuration → Policies → Windows Settings → Scripts (Startup/Shutdown) → Startup → PowerShell Scripts**.
 3. Link the GPO to the target computers' OU.
 
@@ -80,6 +88,7 @@ irm https://raw.githubusercontent.com/killo431/Zabbix_msi_install_gpo/main/insta
 ```
 
 Optional environment overrides are `ZABBIX_PSK_SECRET`, `ZABBIX_PSK_ID`, `ZABBIX_LLD_SCRIPT`, `ZABBIX_CONF_PATH`, and `ZABBIX_AGENT_UNC`. The PSK secret environment variable is removed by the script after it is read.
+Use `ZABBIX_SERVER_ACTIVE`, `ZABBIX_HOST_METADATA`, and `ZABBIX_HOSTNAME_MODE` to override the active-check destination, exact GAS metadata, and `FQDN`/`GAS` hostname mode.
 
 The standalone GPO and `irm | iex` installers also prefer `$AgentUnc` (the
 original FIL004 MSI path) and use the GitHub download only when staging from
