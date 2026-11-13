@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 $Repository = Split-Path $PSScriptRoot -Parent
 $Installer = Join-Path $Repository 'install_agent2_gpo.ps1'
 
-foreach ($Path in @($Installer, (Join-Path $Repository 'New-ZabbixDeployment.ps1'))) {
+foreach ($Path in @($Installer, (Join-Path $Repository 'New-ZabbixDeployment.ps1'), (Join-Path $Repository 'install_agent2_template.ps1'))) {
     $Tokens = $null
     $ParseErrors = $null
     $null = [Management.Automation.Language.Parser]::ParseFile($Path, [ref]$Tokens, [ref]$ParseErrors)
@@ -42,20 +42,41 @@ function Start-Process {
 }
 function Get-Service { param($Name) [pscustomobject]@{ Name = $Name } }
 function Restart-Service { param($Name, [switch]$Force) $TestState.RestartCalls++ }
-function Invoke-WebRequest { throw 'Packaged deployment must not download anything.' }
+function Copy-Item {
+    [CmdletBinding()]
+    param($LiteralPath, $Destination, [switch]$Force)
+    if ($LiteralPath -eq $TestState.DeniedSource) {
+        throw [UnauthorizedAccessException]::new('Test share access denied.')
+    }
+    Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force
+}
+function Invoke-WebRequest {
+    [CmdletBinding()]
+    param($Uri, $OutFile, [switch]$UseBasicParsing)
+    $TestState.DownloadCalls++
+    if (-not $TestState.AllowDownload) { throw 'Unexpected MSI download.' }
+    if ($TestState.DownloadFails) { throw [IO.IOException]::new('Test HTTPS download failed.') }
+    Set-Content -LiteralPath $OutFile -Value $TestState.DownloadContent
+}
 
 $TestRoot = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
 $PreviousProgramData = $env:ProgramData
 $PreviousSystemRoot = $env:SystemRoot
+$PreviousTemp = $env:TEMP
 try {
     New-Item -ItemType Directory -Path $TestRoot | Out-Null
     $env:ProgramData = $TestRoot
     $env:SystemRoot = $TestRoot
+    $env:TEMP = $TestRoot
     $TestState = @{
         AgentConfig = Join-Path $TestRoot 'zabbix_agent2.conf'
         InstalledVersion = ''
         InstallCalls = 0
         RestartCalls = 0
+        DownloadCalls = 0
+        AllowDownload = $false
+        DownloadFails = $false
+        DownloadContent = 'test MSI content'
     }
     $MsiPath = Join-Path $TestRoot 'agent.msi'
     Set-Content -LiteralPath $MsiPath -Value 'test MSI content'
@@ -76,7 +97,10 @@ try {
     Save-Package
     & $Installer -ConfigPath $ConfigPath
     Assert-True ($TestState.InstallCalls -eq 1) 'A fresh client must install the packaged MSI.'
-    Assert-True ($TestState.MsiArguments.Contains($MsiPath)) 'MSI arguments must point to the shared package.'
+    $StagedMsi = Join-Path $TestRoot 'zabbix_agent2-7.0.32-windows-amd64-openssl.msi'
+    Assert-True ($TestState.MsiArguments.Contains($StagedMsi)) 'MSI arguments must point to the locally staged package.'
+    Assert-True ((Get-FileHash $StagedMsi).Hash -eq (Get-FileHash $MsiPath).Hash) 'The shared MSI must be copied to local staging.'
+    Assert-True ($TestState.DownloadCalls -eq 0) 'A reachable shared MSI must not trigger a download.'
     Assert-True ($TestState.MsiArguments.Contains('/qn')) 'MSI installation must be quiet.'
     Assert-True ($TestState.MsiArguments.Contains('/norestart')) 'MSI installation must not trigger an automatic reboot.'
     Assert-True ((Get-Content $TestState.AgentConfig) -contains 'Server=zabbix.example.com') 'The package server must be applied.'
@@ -108,10 +132,35 @@ try {
     Save-Package
     Assert-Fails { & $Installer -ConfigPath $ConfigPath } 'does not match'
     Assert-True ($TestState.InstallCalls -eq 1) 'A hash mismatch must prevent installation.'
+    Assert-True ($TestState.DownloadCalls -eq 0) 'A primary MSI integrity failure must not trigger fallback.'
 
+    $Package.MsiSha256 = (Get-FileHash $MsiPath).Hash
     $Package.ZabbixInstallationMSI = 'missing.msi'
     Save-Package
-    Assert-Fails { & $Installer -ConfigPath $ConfigPath } 'MSI is unavailable'
+    $TestState.AllowDownload = $true
+    & $Installer -ConfigPath $ConfigPath
+    Assert-True ($TestState.DownloadCalls -eq 1 -and $TestState.InstallCalls -eq 2) 'A missing shared MSI must use the HTTPS fallback.'
+
+    $Package.ZabbixInstallationMSI = 'agent.msi'
+    $TestState.DeniedSource = $MsiPath
+    Save-Package
+    & $Installer -ConfigPath $ConfigPath
+    Assert-True ($TestState.DownloadCalls -eq 2 -and $TestState.InstallCalls -eq 3) 'Share access denied must use the HTTPS fallback.'
+    $TestState.DeniedSource = $null
+
+    $Package.ZabbixInstallationMSI = 'missing.msi'
+    $TestState.DownloadContent = 'tampered download'
+    Save-Package
+    Assert-Fails { & $Installer -ConfigPath $ConfigPath } 'does not match'
+    Assert-True ($TestState.InstallCalls -eq 3) 'A downloaded MSI with the wrong hash must not install.'
+    $TestState.DownloadFails = $true
+    $SavedProgressPreference = $ProgressPreference
+    $SavedSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+    Assert-Fails { & $Installer -ConfigPath $ConfigPath } 'Test HTTPS download failed'
+    Assert-True ($TestState.InstallCalls -eq 3) 'An HTTPS failure must not reuse a stale staged MSI.'
+    Assert-True ($ProgressPreference -eq $SavedProgressPreference) 'Download failure must restore progress preferences.'
+    Assert-True ([Net.ServicePointManager]::SecurityProtocol -eq $SavedSecurityProtocol) 'Download failure must restore TLS preferences.'
+
     $Package.DefaultServer = 42
     Save-Package
     Assert-Fails { & $Installer -ConfigPath $ConfigPath } 'string value for DefaultServer'
@@ -123,5 +172,6 @@ try {
 } finally {
     $env:ProgramData = $PreviousProgramData
     $env:SystemRoot = $PreviousSystemRoot
+    $env:TEMP = $PreviousTemp
     Remove-Item -LiteralPath $TestRoot -Recurse -Force
 }

@@ -17,13 +17,20 @@ Download or clone this repository to a domain-joined Windows file server. In
 Create that AD security group first and add the target **computer accounts**,
 not users. The runner creates a new `C:\ProgramData\ZabbixDeployment` directory
 and `ZabbixAgent2$` SMB share. Use `-PackagePath` and `-ShareName` to change them.
-It refuses to overwrite an existing directory or share.
+It refuses to overwrite an existing directory or share. The primary MSI source
+is `\\gas-fil004\packages\Zabbix Agent 2\zabbix_agent2-7.0.32-windows-amd64-openssl.msi`,
+matching the original deployment script; use `-AgentUnc` to select another source.
+The runner copies from this share first and uses the GitHub download only if
+copying fails or the source is missing/inaccessible.
 
 The package contains the signed 7.0.32 MSI, `deployment.json`, the installer,
 and `Start-ZabbixDeployment.ps1`. The runner checks the MSI's Authenticode
 signature and records its SHA256 hash, which the installer verifies before use.
-An optional `-LldScript` file is copied into the package. Clients read the MSI
-from the share instead of downloading it from the internet.
+An optional `-LldScript` file is copied into the package. Clients copy the MSI
+from the deployment share to local staging before running it. If that MSI
+cannot be copied, they fall back to the fixed GitHub HTTPS URL.
+An empty MSI, invalid signature, or SHA256 mismatch stops deployment rather
+than silently switching sources. Downloads must match the package's SHA256 hash.
 
 For PSK authentication, provide a matching identity and securely prompted key:
 
@@ -44,8 +51,10 @@ Add the **UNC launcher path printed by the runner** to the GPO's computer
 startup PowerShell scripts, then link the GPO to the target computers' OU.
 Keep the launcher in the share beside its configuration and installer.
 Enable **Always wait for the network at computer startup and logon** and ensure
-the computers can reach the share over SMB (TCP 445). Only the file server needs
-internet access during package creation. The runner does not create or link a
+the computers can reach the share over SMB (TCP 445). Internet access is needed
+only on machines using the download fallback. Clients still need the launcher,
+configuration, and any LLD script; fallback replaces only the MSI, not the
+entire deployment share. The runner does not create or link a
 GPO, modify firewall rules, or change execution-policy/domain signing settings.
 If script signing is required, sign the packaged scripts before deployment.
 Failures stop setup; any partial directory is left for inspection, not published
@@ -70,4 +79,10 @@ $env:ZABBIX_SERVER = "zabbix.example.com"
 irm https://raw.githubusercontent.com/killo431/Zabbix_msi_install_gpo/main/install_agent2_template.ps1 | iex
 ```
 
-Optional environment overrides are `ZABBIX_PSK_SECRET`, `ZABBIX_PSK_ID`, `ZABBIX_LLD_SCRIPT`, and `ZABBIX_CONF_PATH`. The PSK secret environment variable is removed by the script after it is read.
+Optional environment overrides are `ZABBIX_PSK_SECRET`, `ZABBIX_PSK_ID`, `ZABBIX_LLD_SCRIPT`, `ZABBIX_CONF_PATH`, and `ZABBIX_AGENT_UNC`. The PSK secret environment variable is removed by the script after it is read.
+
+The standalone GPO and `irm | iex` installers also prefer `$AgentUnc` (the
+original FIL004 MSI path) and use the GitHub download only when staging from
+that source fails. Both require a valid Zabbix SIA Authenticode signature when
+no deployment-package SHA256 hash is provided. They use the current execution
+identity to access SMB; no SMB credentials are embedded or passed to `net use`.

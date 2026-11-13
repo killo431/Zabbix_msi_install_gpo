@@ -9,6 +9,7 @@
 # User-configurable variables
 $ZabbixMsiUrl = "https://github.com/killo431/packages/releases/download/main/zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
 $ZabbixAgentVersion = "7.0.32"
+$AgentUnc = "\\gas-fil004\packages\Zabbix Agent 2\zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
 $PskSecret = ""
 $DefaultPskId = ""
 $DefaultServer = ""
@@ -21,6 +22,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_PSK_SECRET)) { $PskSecret = $e
 if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_PSK_ID)) { $DefaultPskId = $env:ZABBIX_PSK_ID }
 if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_LLD_SCRIPT)) { $LldScript = $env:ZABBIX_LLD_SCRIPT }
 if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_CONF_PATH)) { $ConfPath = $env:ZABBIX_CONF_PATH }
+if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_AGENT_UNC)) { $AgentUnc = $env:ZABBIX_AGENT_UNC }
 Remove-Item Env:\ZABBIX_PSK_SECRET -ErrorAction SilentlyContinue
 
 $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -103,16 +105,33 @@ if (-not $ConfigExists) {
 
 if ($InstallRequired) {
     $MsiPath = Join-Path -Path $env:TEMP -ChildPath "zabbix_agent2-$ZabbixAgentVersion-windows-amd64-openssl.msi"
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $PreviousProgressPreference = $ProgressPreference
-    try {
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $ZabbixMsiUrl -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop | Out-Null
-    } finally {
-        $ProgressPreference = $PreviousProgressPreference
+    $MsiCopied = $false
+    if (-not [string]::IsNullOrWhiteSpace($AgentUnc)) {
+        try {
+            Copy-Item -LiteralPath $AgentUnc -Destination $MsiPath -Force -ErrorAction Stop
+            $MsiCopied = $true
+        } catch [IO.IOException], [UnauthorizedAccessException], [Management.Automation.ItemNotFoundException], [Management.Automation.DriveNotFoundException] {
+            Write-Warning "Cannot stage MSI from $AgentUnc; using the HTTPS fallback. $($_.Exception.Message)"
+        }
+    }
+    if (-not $MsiCopied) {
+        $PreviousProgressPreference = $ProgressPreference
+        $PreviousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+        try {
+            $ProgressPreference = 'SilentlyContinue'
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $ZabbixMsiUrl -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop | Out-Null
+        } finally {
+            $ProgressPreference = $PreviousProgressPreference
+            [Net.ServicePointManager]::SecurityProtocol = $PreviousSecurityProtocol
+        }
     }
     if (-not (Test-Path -LiteralPath $MsiPath -PathType Leaf) -or (Get-Item -LiteralPath $MsiPath).Length -eq 0) {
-        throw "The Zabbix MSI download failed or produced an empty file: $ZabbixMsiUrl"
+        throw "The staged Zabbix MSI is missing or empty: $MsiPath"
+    }
+    $Signature = Get-AuthenticodeSignature -LiteralPath $MsiPath -ErrorAction Stop
+    if ($Signature.Status -ne 'Valid' -or $Signature.SignerCertificate.Subject -notmatch 'O="?Zabbix SIA"?(,|$)') {
+        throw "The staged MSI must have a valid Zabbix SIA Authenticode signature."
     }
 
     $MsiProperties = @(

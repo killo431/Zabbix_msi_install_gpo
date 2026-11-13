@@ -16,6 +16,8 @@ param(
 
     [string]$PackagePath = (Join-Path $env:ProgramData 'ZabbixDeployment'),
 
+    [string]$AgentUnc = '\\gas-fil004\packages\Zabbix Agent 2\zabbix_agent2-7.0.32-windows-amd64-openssl.msi',
+
     [Security.SecureString]$PskSecret,
 
     [string]$DefaultPskId = '',
@@ -100,18 +102,29 @@ Set-Acl -LiteralPath $PackagePath -AclObject $Acl
 $MsiName = 'zabbix_agent2-7.0.32-windows-amd64-openssl.msi'
 $MsiPath = Join-Path $PackagePath $MsiName
 $MsiUrl = "https://github.com/killo431/packages/releases/download/main/$MsiName"
-$PreviousProgressPreference = $ProgressPreference
-$PreviousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
-try {
-    $ProgressPreference = 'SilentlyContinue'
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $MsiUrl -OutFile $MsiPath -UseBasicParsing
-} finally {
-    $ProgressPreference = $PreviousProgressPreference
-    [Net.ServicePointManager]::SecurityProtocol = $PreviousSecurityProtocol
+$MsiCopied = $false
+if (-not [string]::IsNullOrWhiteSpace($AgentUnc)) {
+    try {
+        Copy-Item -LiteralPath $AgentUnc -Destination $MsiPath -Force -ErrorAction Stop
+        $MsiCopied = $true
+    } catch [IO.IOException], [UnauthorizedAccessException], [Management.Automation.ItemNotFoundException], [Management.Automation.DriveNotFoundException] {
+        Write-Warning "Cannot stage MSI from $AgentUnc; using the HTTPS fallback. $($_.Exception.Message)"
+    }
+}
+if (-not $MsiCopied) {
+    $PreviousProgressPreference = $ProgressPreference
+    $PreviousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $MsiUrl -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop | Out-Null
+    } finally {
+        $ProgressPreference = $PreviousProgressPreference
+        [Net.ServicePointManager]::SecurityProtocol = $PreviousSecurityProtocol
+    }
 }
 if ((Get-Item -LiteralPath $MsiPath).Length -eq 0) {
-    throw 'The downloaded MSI is empty. The deployment share has not been created.'
+    throw 'The staged MSI is empty. The deployment share has not been created.'
 }
 $Signature = Get-AuthenticodeSignature -LiteralPath $MsiPath
 if ($Signature.Status -ne 'Valid' -or $Signature.SignerCertificate.Subject -notmatch 'O="?Zabbix SIA"?(,|$)') {
