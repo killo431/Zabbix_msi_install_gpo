@@ -1,5 +1,5 @@
 # Run from an elevated Windows PowerShell 5.1 session. Every system-changing call is mocked
-# and ProgramData/SystemRoot/TEMP are redirected to a temporary folder.
+# and ProgramData/TEMP are redirected to a temporary folder.
 $ErrorActionPreference = 'Stop'
 $CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $CurrentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -115,12 +115,10 @@ function Test-NetConnection { param($ComputerName, $Port, $InformationLevel, $Wa
 
 $TestRoot = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
 $PreviousProgramData = $env:ProgramData
-$PreviousSystemRoot = $env:SystemRoot
 $PreviousTemp = $env:TEMP
 try {
     New-Item -ItemType Directory -Path $TestRoot | Out-Null
     $env:ProgramData = $TestRoot
-    $env:SystemRoot = $TestRoot
     $env:TEMP = $TestRoot
     $TestState = @{
         AgentConfig = Join-Path $TestRoot 'zabbix_agent2.conf'
@@ -381,7 +379,6 @@ try {
         Remove-Item -Path "Env:\$Name" -ErrorAction SilentlyContinue
     }
     $env:ProgramData = $PreviousProgramData
-    $env:SystemRoot = $PreviousSystemRoot
     $env:TEMP = $PreviousTemp
     Remove-Item -LiteralPath $TestRoot -Recurse -Force
 }

@@ -203,7 +203,7 @@ certificate before linking the GPO. Re-sign after any change.
 
 `tests/Test-Deployment.ps1` runs in an elevated Windows PowerShell 5.1 session.
 All system-changing calls (msiexec, service restart, permission changes, event
-log, registry, network) are mocked, and ProgramData/SystemRoot/TEMP are
+log, registry, network) are mocked, and ProgramData/TEMP are
 redirected to a temporary folder. GitHub Actions (`.github/workflows/ci.yml`)
 runs PSScriptAnalyzer (fails on errors, reports warnings) and the tests on
 `windows-latest` for every push and pull request.
