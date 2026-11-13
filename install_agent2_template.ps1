@@ -35,6 +35,33 @@ if (-not [string]::IsNullOrWhiteSpace($LldScript) -and -not (Test-Path -LiteralP
 $InstallFolder = Split-Path -Path $ConfPath -Parent
 $PskDirectory = Join-Path -Path $env:ProgramData -ChildPath "ZabbixAgent2"
 $PskFilePath = Join-Path -Path $PskDirectory -ChildPath "zabbix_agent2.psk"
+$PskFileChanged = $false
+
+if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
+    if (($PskSecret.Length % 2) -ne 0) {
+        throw "PskSecret must contain an even number of hexadecimal characters."
+    }
+    New-Item -ItemType Directory -Path $PskDirectory -Force -ErrorAction Stop | Out-Null
+    & "$env:SystemRoot\System32\icacls.exe" $PskDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to secure the PSK directory: $PskDirectory"
+    }
+    if (-not (Test-Path -LiteralPath $PskFilePath -PathType Leaf)) {
+        [System.IO.File]::WriteAllText($PskFilePath, "", [System.Text.Encoding]::ASCII)
+    }
+    & "$env:SystemRoot\System32\icacls.exe" $PskFilePath /inheritance:r /grant:r '*S-1-5-18:(R)' '*S-1-5-32-544:(F)' | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to secure the PSK file: $PskFilePath"
+    }
+    $PreviousPskSecret = [System.IO.File]::ReadAllText($PskFilePath)
+    $PskFileChanged = $PreviousPskSecret -cne $PskSecret
+    if ($PskFileChanged) {
+        [System.IO.File]::WriteAllText($PskFilePath, $PskSecret, [System.Text.Encoding]::ASCII)
+    }
+} elseif (Test-Path -LiteralPath $PskFilePath -PathType Leaf) {
+    Remove-Item -LiteralPath $PskFilePath -Force -ErrorAction Stop
+    $PskFileChanged = $true
+}
 
 # Construct the FQDN (Fully Qualified Domain Name) of the local computer
 $ComputerSystem = Get-WmiObject -Class Win32_ComputerSystem
@@ -80,23 +107,6 @@ if ($InstallRequired) {
     )
 
     if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
-        if (($PskSecret.Length % 2) -ne 0) {
-            throw "PskSecret must contain an even number of hexadecimal characters."
-        }
-        New-Item -ItemType Directory -Path $PskDirectory -Force -ErrorAction Stop | Out-Null
-        & "$env:SystemRoot\System32\icacls.exe" $PskDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Unable to secure the PSK directory: $PskDirectory"
-        }
-        if (-not (Test-Path -LiteralPath $PskFilePath -PathType Leaf)) {
-            [System.IO.File]::WriteAllText($PskFilePath, "", [System.Text.Encoding]::ASCII)
-        }
-        & "$env:SystemRoot\System32\icacls.exe" $PskFilePath /inheritance:r /grant:r '*S-1-5-18:(R)' '*S-1-5-32-544:(F)' | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Unable to secure the PSK file: $PskFilePath"
-        }
-        [System.IO.File]::WriteAllText($PskFilePath, $PskSecret, [System.Text.Encoding]::ASCII)
-
         $MsiProperties += @(
             "TLSCONNECT=psk"
             "TLSACCEPT=psk"
@@ -123,16 +133,23 @@ $Configuration = [ordered]@{
     LogFileSize = "20"
     DebugLevel = "3"
 }
+$ManagedPattern = '^\s*#?\s*(Server|HostMetadata|Hostname|LogFileSize|DebugLevel)\s*='
+$ConfigLines = @(Get-Content -LiteralPath $ConfPath -ErrorAction Stop | Where-Object { $_ -notmatch $ManagedPattern })
+
 if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
-    $Configuration.TLSConnect = "psk"
-    $Configuration.TLSAccept = "psk"
-    $Configuration.TLSPSKIdentity = $DefaultPskId
-    $Configuration.TLSPSKFile = $PskFilePath
+    $TlsPattern = '^\s*#?\s*(TLSConnect|TLSAccept|TLSPSKIdentity|TLSPSKFile|TLSPSKValue)\s*='
+    $ConfigLines = @($ConfigLines | Where-Object { $_ -notmatch $TlsPattern })
+    $Configuration['TLSConnect'] = "psk"
+    $Configuration['TLSAccept'] = "psk"
+    $Configuration['TLSPSKIdentity'] = $DefaultPskId
+    $Configuration['TLSPSKFile'] = $PskFilePath
+} else {
+    $ConfigLines = @($ConfigLines | Where-Object {
+        $_ -notmatch '^\s*#?\s*TLSPSK(Identity|File|Value)\s*=' -and
+        $_ -notmatch '^\s*#?\s*TLS(Connect|Accept)\s*=\s*psk\s*$'
+    })
 }
 
-$ManagedKeys = @($Configuration.Keys)
-$ManagedPattern = '^\s*#?\s*(' + (($ManagedKeys | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')\s*='
-$ConfigLines = @(Get-Content -LiteralPath $ConfPath -ErrorAction Stop | Where-Object { $_ -notmatch $ManagedPattern })
 foreach ($Key in $Configuration.Keys) {
     $ConfigLines += "$Key=$($Configuration[$Key])"
 }
@@ -150,7 +167,7 @@ if (-not [string]::IsNullOrWhiteSpace($LldScript)) {
     Copy-Item -LiteralPath $LldScript -Destination $ScriptsFolder -Force -ErrorAction Stop
 }
 
-if ($ConfigurationChanged) {
+if ($ConfigurationChanged -or $PskFileChanged) {
     $AgentService = Get-Service -Name "Zabbix Agent2" -ErrorAction SilentlyContinue
     if ($null -eq $AgentService) {
         throw "Agent configuration changed, but the Zabbix Agent2 service was not found."
