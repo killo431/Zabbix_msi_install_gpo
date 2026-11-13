@@ -2,7 +2,12 @@ $ErrorActionPreference = 'Stop'
 $Repository = Split-Path $PSScriptRoot -Parent
 $Installer = Join-Path $Repository 'install_agent2_gpo.ps1'
 
-foreach ($Path in @($Installer, (Join-Path $Repository 'New-ZabbixDeployment.ps1'), (Join-Path $Repository 'install_agent2_template.ps1'))) {
+foreach ($Path in @(
+    $Installer,
+    (Join-Path $Repository 'New-ZabbixDeployment.ps1'),
+    (Join-Path $Repository 'install_agent2_template.ps1'),
+    (Join-Path $Repository 'Test-ZabbixAgentConfiguration.ps1')
+)) {
     $Tokens = $null
     $ParseErrors = $null
     $null = [Management.Automation.Language.Parser]::ParseFile($Path, [ref]$Tokens, [ref]$ParseErrors)
@@ -58,6 +63,9 @@ function Invoke-WebRequest {
     if ($TestState.DownloadFails) { throw [IO.IOException]::new('Test HTTPS download failed.') }
     Set-Content -LiteralPath $OutFile -Value $TestState.DownloadContent
 }
+function Get-Service { param($Name, $ErrorAction) [pscustomobject]@{ Name = $Name; Status = 'Running' } }
+function Get-CimInstance { param($ClassName, $ErrorAction) [pscustomobject]@{ DNSHostName = 'testhost'; Domain = 'example.com' } }
+function Test-NetConnection { param($ComputerName, $Port, $InformationLevel, $WarningAction) $true }
 
 $TestRoot = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
 $PreviousProgramData = $env:ProgramData
@@ -78,6 +86,30 @@ try {
         DownloadFails = $false
         DownloadContent = 'test MSI content'
     }
+    $Checker = Join-Path $Repository 'Test-ZabbixAgentConfiguration.ps1'
+    $FakeAgent = Join-Path $TestRoot 'zabbix_agent2.exe'
+    Set-Content -LiteralPath $FakeAgent -Value 'test agent'
+    $PskFile = Join-Path $TestRoot 'agent.psk'
+    Set-Content -LiteralPath $PskFile -Value 'DO-NOT-LEAK-THIS-PSK'
+    $HealthConfig = Join-Path $TestRoot 'health.conf'
+    @(
+        'Server=172.17.6.24'
+        'ServerActive=zbx01.example.com'
+        'Hostname=testhost.example.com'
+        'HostMetadata=GAS;windows;ADC;server'
+        'TLSConnect=psk'
+        'TLSAccept=psk'
+        'TLSPSKIdentity=ZabbixPSK'
+        "TLSPSKFile=$PskFile"
+        'TLSPSKValue=DO-NOT-LEAK-THIS-PSK'
+        '#Server=commented duplicate is ignored'
+    ) | Set-Content -LiteralPath $HealthConfig
+    $HealthSummary = & $Checker -ConfigPath $HealthConfig -AgentExePath $FakeAgent -ExpectedServer '172.17.6.24' -ExpectedServerActive 'zbx01.example.com' -SkipAgentConfigTest
+    Assert-True ($HealthSummary.ExitCode -eq 0) 'A correct agent configuration must pass.'
+    Assert-True (($HealthSummary | Out-String) -notmatch 'DO-NOT-LEAK-THIS-PSK') 'Health-check output must not leak PSK data.'
+    $BadHealthSummary = & $Checker -ConfigPath $HealthConfig -AgentExePath $FakeAgent -ExpectedServer '172.17.6.24' -ExpectedServerActive 'wrong.example.com' -SkipAgentConfigTest -SkipNetworkCheck
+    Assert-True ($BadHealthSummary.ExitCode -eq 1) 'A mismatched ServerActive must fail the health check.'
+
     $MsiPath = Join-Path $TestRoot 'agent.msi'
     Set-Content -LiteralPath $MsiPath -Value 'test MSI content'
     $LldPath = Join-Path $TestRoot 'lld.ps1'

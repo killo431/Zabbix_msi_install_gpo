@@ -78,6 +78,29 @@ Use `install_agent2_gpo.ps1` as a computer startup PowerShell script:
 
 The MSI runs quietly. Installation/configuration errors are raised by the script.
 
+## Automatic agent configuration check
+
+Run `Test-ZabbixAgentConfiguration.ps1` on an agent to check its configuration
+directives, service and executable, PSK file presence when PSK mode is enabled,
+the agent's built-in config test, and TCP reachability to the first
+`ServerActive` endpoint. It is read-only and returns an object with an `ExitCode`
+of `1` if any checks fail:
+
+```powershell
+$result = .\Test-ZabbixAgentConfiguration.ps1 `
+    -ExpectedServer "zabbix.example.com" `
+    -ExpectedServerActive "zbx01.example.com" `
+    -ExpectedHostMetadata "GAS;windows;ADC;server" `
+    -HostnameMode FQDN
+if ($result.ExitCode -ne 0) { Write-Error "Zabbix agent check failed." }
+```
+
+Set `-ExpectedHostMetadata "GAS;windows;ADC;sql"` for SQL hosts or
+`-HostnameMode GAS` for `GAS-<computername>` hostnames. See
+`ZABBIX_CONFIGURATION_AGENT_PROMPT.md` for a reusable read-only diagnostic
+prompt and approval-gated remediation guidance. The checker does not verify
+server-side host registration, item state, or triggers.
+
 ## Interactive PowerShell setup
 
 Run an elevated PowerShell session, set your server address, then fetch and execute `install_agent2_template.ps1`:
