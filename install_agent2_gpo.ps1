@@ -2,6 +2,10 @@
 ##Deploy under Computer Configuration -> Policies -> Windows Settings -> Scripts -> Startup -> PowerShell Scripts.
 ##Set the server and optional PSK/script variables below before assigning the script to a GPO.
 
+param(
+    [string]$ConfigPath
+)
+
 # User-configurable variables
 $ZabbixMsiUrl = "https://github.com/killo431/packages/releases/download/main/zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
 $ZabbixAgentVersion = "7.0.32"
@@ -10,6 +14,36 @@ $DefaultPskId = ""
 $DefaultServer = ""
 $LldScript = ""
 $ConfPath = "C:\Program Files\Zabbix Agent 2\zabbix_agent2.conf"
+$ZabbixInstallationMSI = ""
+$MsiSha256 = ""
+
+if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+    $PackageConfigPath = Join-Path -Path $PSScriptRoot -ChildPath "deployment.json"
+    if (Test-Path -LiteralPath $PackageConfigPath -PathType Leaf) {
+        $ConfigPath = $PackageConfigPath
+    }
+}
+if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+    $Package = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    foreach ($Name in @('DefaultServer', 'PskSecret', 'DefaultPskId', 'LldScript', 'ConfPath', 'ZabbixInstallationMSI', 'MsiSha256')) {
+        if ($null -eq $Package.PSObject.Properties[$Name] -or $Package.$Name -isnot [string]) {
+            throw "Deployment configuration must contain a string value for $Name."
+        }
+    }
+    $DefaultServer = $Package.DefaultServer
+    $PskSecret = $Package.PskSecret
+    $DefaultPskId = $Package.DefaultPskId
+    $ConfPath = $Package.ConfPath
+    $PackageRoot = Split-Path -Path (Resolve-Path -LiteralPath $ConfigPath -ErrorAction Stop).Path -Parent
+    $ZabbixInstallationMSI = Join-Path -Path $PackageRoot -ChildPath $Package.ZabbixInstallationMSI
+    $MsiSha256 = $Package.MsiSha256
+    if ($MsiSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "Deployment configuration must contain the MSI SHA256 hash."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Package.LldScript)) {
+        $LldScript = Join-Path -Path $PackageRoot -ChildPath $Package.LldScript
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($DefaultServer)) {
     throw "Set DefaultServer to the Zabbix server or proxy address before deployment."
@@ -83,14 +117,24 @@ if (-not $ConfigExists) {
 }
 
 if ($InstallRequired) {
-    $MsiPath = Join-Path -Path $env:TEMP -ChildPath "zabbix_agent2-$ZabbixAgentVersion-windows-amd64-openssl.msi"
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $PreviousProgressPreference = $ProgressPreference
-    try {
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $ZabbixMsiUrl -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop | Out-Null
-    } finally {
-        $ProgressPreference = $PreviousProgressPreference
+    if (-not [string]::IsNullOrWhiteSpace($ZabbixInstallationMSI)) {
+        $MsiPath = $ZabbixInstallationMSI
+        if (-not (Test-Path -LiteralPath $MsiPath -PathType Leaf)) {
+            throw "The deployment MSI is unavailable: $MsiPath"
+        }
+        if ((Get-FileHash -LiteralPath $MsiPath -Algorithm SHA256 -ErrorAction Stop).Hash -ine $MsiSha256) {
+            throw "The deployment MSI does not match the configured SHA256 hash."
+        }
+    } else {
+        $MsiPath = Join-Path -Path $env:TEMP -ChildPath "zabbix_agent2-$ZabbixAgentVersion-windows-amd64-openssl.msi"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $PreviousProgressPreference = $ProgressPreference
+        try {
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $ZabbixMsiUrl -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop | Out-Null
+        } finally {
+            $ProgressPreference = $PreviousProgressPreference
+        }
     }
     if (-not (Test-Path -LiteralPath $MsiPath -PathType Leaf) -or (Get-Item -LiteralPath $MsiPath).Length -eq 0) {
         throw "The Zabbix MSI download failed or produced an empty file: $ZabbixMsiUrl"
@@ -115,7 +159,7 @@ if ($InstallRequired) {
         )
     }
 
-    $MsiArguments = '/i "{0}" {1} /qn' -f $MsiPath, ($MsiProperties -join ' ')
+    $MsiArguments = '/i "{0}" {1} /qn /norestart' -f $MsiPath, ($MsiProperties -join ' ')
     $MsiProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $MsiArguments -WindowStyle Hidden -Wait -PassThru
     if ($MsiProcess.ExitCode -notin @(0, 3010)) {
         throw "Zabbix Agent 2 MSI installation failed with exit code $($MsiProcess.ExitCode)."
