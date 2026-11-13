@@ -2,10 +2,9 @@
 #
 ##Author: https://github.com/Padl3xx
 #
-##The script starts the GPO when the computer starts, it is applied to computers, not users.
-##Create a new GPO, go to, Computer Configuration -> Policies -> Windows Settings -> Scripts -> Startup -> Powershell Scripts -> Add.
-##Dont forget to link the GPO on specified OU :-)
-##It should probably work if you run the installation directly from your computer, but I haven't tried that.
+##For an elevated interactive PowerShell setup, set ZABBIX_SERVER and run:
+##irm https://raw.githubusercontent.com/killo431/Zabbix_msi_install_gpo/main/install_agent2_template.ps1 | iex
+##The script can also be deployed as a computer startup GPO script.
 
 # User-configurable variables
 $ZabbixMsiUrl = "https://github.com/killo431/packages/releases/download/main/zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
@@ -16,8 +15,22 @@ $DefaultServer = ""
 $LldScript = ""
 $ConfPath = "C:\Program Files\Zabbix Agent 2\zabbix_agent2.conf"
 
+# Environment overrides allow this file to run through irm | iex without editing it first.
+if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_SERVER)) { $DefaultServer = $env:ZABBIX_SERVER }
+if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_PSK_SECRET)) { $PskSecret = $env:ZABBIX_PSK_SECRET }
+if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_PSK_ID)) { $DefaultPskId = $env:ZABBIX_PSK_ID }
+if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_LLD_SCRIPT)) { $LldScript = $env:ZABBIX_LLD_SCRIPT }
+if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_CONF_PATH)) { $ConfPath = $env:ZABBIX_CONF_PATH }
+Remove-Item Env:\ZABBIX_PSK_SECRET -ErrorAction SilentlyContinue
+
+$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run this setup from an elevated PowerShell session."
+}
+
 if ([string]::IsNullOrWhiteSpace($DefaultServer)) {
-    throw "Set DefaultServer to the Zabbix server or proxy address before deployment."
+    throw "Set DefaultServer or the ZABBIX_SERVER environment variable to the Zabbix server or proxy address."
 }
 if ([string]::IsNullOrWhiteSpace($PskSecret) -xor [string]::IsNullOrWhiteSpace($DefaultPskId)) {
     throw "Set both PskSecret and DefaultPskId, or leave both empty."
