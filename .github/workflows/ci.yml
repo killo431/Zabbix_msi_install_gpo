@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.23.0 -Scope CurrentUser -Force -AllowClobber
+
+      - name: Lint
+        shell: powershell
+        run: |
+          $Results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
+          $Results | Format-Table Severity, RuleName, ScriptName, Line, Message -AutoSize -Wrap | Out-String -Width 220 | Write-Host
+          if ($Results | Where-Object Severity -eq 'Error') { throw 'PSScriptAnalyzer reported errors.' }
+
+      - name: Tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\Test-Deployment.ps1

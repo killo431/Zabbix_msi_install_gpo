@@ -126,18 +126,87 @@ server-side host registration, item state, or triggers.
 
 ## Interactive PowerShell setup
 
-Run an elevated PowerShell session, set your server address, then fetch and execute `install_agent2_template.ps1`:
+`install_agent2_template.ps1` is a small wrapper that downloads and runs
+`install_agent2_gpo.ps1`, so the interactive and GPO paths share one
+installer. In an elevated PowerShell session:
 
 ```powershell
 $env:ZABBIX_SERVER = "zabbix.example.com"
+$env:ZABBIX_SCRIPT_REF = "<release tag or commit SHA>"   # pin what you run
 irm https://raw.githubusercontent.com/killo431/Zabbix_msi_install_gpo/main/install_agent2_template.ps1 | iex
 ```
 
-Optional environment overrides are `ZABBIX_PSK_SECRET`, `ZABBIX_PSK_ID`, `ZABBIX_LLD_SCRIPT`, `ZABBIX_CONF_PATH`, and `ZABBIX_AGENT_UNC`. The PSK secret environment variable is removed by the script after it is read.
-Use `ZABBIX_SERVER_ACTIVE`, `ZABBIX_HOST_METADATA`, and `ZABBIX_HOSTNAME_MODE` to override the active-check destination, exact GAS metadata, and `FQDN`/`GAS` hostname mode.
+Without `ZABBIX_SCRIPT_REF` the installer comes from `main` and a warning is
+shown; pin a tag or commit in production. You can also copy
+`install_agent2_gpo.ps1` to the host and run it directly with the same
+environment variables.
 
-The standalone GPO and `irm | iex` installers also prefer `$AgentUnc` (the
-original FIL004 MSI path) and use the GitHub download only when staging from
-that source fails. Both require a valid Zabbix SIA Authenticode signature when
-no deployment-package SHA256 hash is provided. They use the current execution
-identity to access SMB; no SMB credentials are embedded or passed to `net use`.
+Optional overrides: `ZABBIX_SERVER_ACTIVE`, `ZABBIX_HOST_METADATA`,
+`ZABBIX_HOSTNAME_MODE` (`FQDN`/`GAS`), `ZABBIX_PSK_SECRET`, `ZABBIX_PSK_ID`,
+`ZABBIX_LLD_SCRIPT`, `ZABBIX_CONF_PATH`, and `ZABBIX_AGENT_UNC`. The PSK
+environment variable is cleared after it is read. Environment overrides are
+ignored when a `deployment.json` package is used.
+
+In standalone and interactive mode the installer prefers the UNC MSI path and
+uses the GitHub download only when staging from it fails. Without a package
+SHA256 hash, the MSI must carry a valid Zabbix SIA Authenticode signature. SMB
+access uses the current identity; no credentials are embedded.
+
+## Operations
+
+### Monitoring the rollout
+
+Each run writes one Application event log entry, source
+`ZabbixAgentDeployment`: **1000** (Information) on success, with the target
+version, whether the MSI ran, whether configuration or PSK changed, and the
+hostname; **1001** (Error) on failure, with the reason. Forward these with
+Windows Event Forwarding or your SIEM. Details are in
+`%ProgramData%\ZabbixAgent2\logs`. Then confirm on the Zabbix side that hosts
+autoregistered and receive data, and use `Test-ZabbixAgentConfiguration.ps1`
+on any host that did not.
+
+Startup scripts run only at boot. Plan the rollout around reboot cycles, or run
+the launcher once through your remote-management tool for faster coverage.
+
+### Upgrading the agent
+
+Deployment packages are immutable. To roll out a new agent version:
+
+1. Build a new package beside the old one:
+   ```powershell
+   .\New-ZabbixDeployment.ps1 -ZabbixAgentVersion 7.0.33 `
+       -PackagePath C:\ProgramData\ZabbixDeployment-7.0.33 -ShareName 'ZabbixAgent2-7033$' `
+       -DefaultServer ... -ReadAccess ...
+   ```
+2. Point the GPO startup script at the new launcher path. Pilot on a test OU first.
+3. When event 1000 shows the new version across the fleet, remove the old share
+   (`Remove-SmbShare`) and directory.
+
+Hosts already on the target version only re-check configuration; the MSI is not
+re-run. Downgrades are not performed.
+
+### Rotating the PSK
+
+Clients pick up a new PSK at their next startup, so the old and new keys are
+both in use during the rollout. Build a package with the new key and identity
+as above, and coordinate the change on the Zabbix side (host encryption settings
+or autoregistration PSK) so the server accepts the new identity before clients
+switch. Then retire the old package; it contains the old key in plaintext.
+
+### Script signing
+
+If your domain enforces `AllSigned`, sign `install_agent2_gpo.ps1` and the
+generated `Start-ZabbixDeployment.ps1` in the package with your code-signing
+certificate before linking the GPO. Re-sign after any change.
+
+## Development
+
+`tests/Test-Deployment.ps1` runs in an elevated Windows PowerShell 5.1 session.
+All system-changing calls (msiexec, service restart, permission changes, event
+log, registry, network) are mocked, and ProgramData/SystemRoot/TEMP are
+redirected to a temporary folder. GitHub Actions (`.github/workflows/ci.yml`)
+runs PSScriptAnalyzer (fails on errors, reports warnings) and the tests on
+`windows-latest` for every push and pull request.
+
+Generated packages (`deployment.json`, MSI, launcher) are git-ignored; never
+commit them. They can contain the PSK.

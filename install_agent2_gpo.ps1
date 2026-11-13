@@ -1,7 +1,10 @@
-##Zabbix Agent 2 silent installer for computer startup Group Policy.
-##Deploy under Computer Configuration -> Policies -> Windows Settings -> Scripts -> Startup -> PowerShell Scripts.
-##Set the server and optional PSK/script variables below before assigning the script to a GPO.
-##Logs are written to %ProgramData%\ZabbixAgent2\logs (readable by SYSTEM and Administrators only).
+##Zabbix Agent 2 silent installer.
+##Package mode: run through Start-ZabbixDeployment.ps1 created by New-ZabbixDeployment.ps1.
+##Standalone GPO mode: set the variables below and assign this file as a computer startup PowerShell script.
+##Interactive mode: set ZABBIX_* environment variables in an elevated session and run this file
+##(or install_agent2_template.ps1 through irm | iex). Environment overrides apply only without deployment.json.
+##Logs: %ProgramData%\ZabbixAgent2\logs (SYSTEM/Administrators only) and the Application event log,
+##source ZabbixAgentDeployment (1000 = success, 1001 = failure).
 
 param(
     [string]$ConfigPath
@@ -29,20 +32,38 @@ $AdministratorsSid = New-Object -TypeName Security.Principal.SecurityIdentifier 
 # SYSTEM, Administrators, TrustedInstaller
 $TrustedOwnerSids = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
 $LogFile = $null
+$EventSource = 'ZabbixAgentDeployment'
 
 function Write-Log {
     param([string]$Message)
-    if (-not $script:LogFile) { return }
+    if (-not $LogFile) { return }
     try {
-        Add-Content -LiteralPath $script:LogFile -Value ('{0:yyyy-MM-dd HH:mm:ss} {1}' -f (Get-Date), $Message) -Encoding UTF8 -ErrorAction Stop
+        Add-Content -LiteralPath $LogFile -Value ('{0:yyyy-MM-dd HH:mm:ss} {1}' -f (Get-Date), $Message) -Encoding UTF8 -ErrorAction Stop
     } catch {
         # Logging must never break deployment.
     }
 }
 
+function Write-DeploymentEvent {
+    # One event per run so monitoring/SIEM can track rollout without reading local logs.
+    param([string]$EntryType, [int]$EventId, [string]$Message)
+    try {
+        New-EventLog -LogName Application -Source $EventSource -ErrorAction SilentlyContinue
+        Write-EventLog -LogName Application -Source $EventSource -EventId $EventId -EntryType $EntryType -Message $Message -ErrorAction Stop
+    } catch {
+        # Event logging is best effort (unavailable in PowerShell 7 or without the source).
+    }
+}
+
 trap {
     Write-Log "ERROR: $($_.Exception.Message)"
+    Write-DeploymentEvent -EntryType Error -EventId 1001 -Message "Zabbix Agent 2 deployment failed: $($_.Exception.Message)"
     break
+}
+
+$CurrentPrincipal = New-Object -TypeName Security.Principal.WindowsPrincipal -ArgumentList ([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $CurrentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run this installer as SYSTEM (GPO startup script) or from an elevated PowerShell session."
 }
 
 function Initialize-SecureDirectory {
@@ -121,7 +142,7 @@ if ((Test-Path -LiteralPath $LogFile -PathType Leaf) -and (Get-Item -LiteralPath
 }
 Write-Log "Starting Zabbix Agent 2 deployment."
 
-if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+if ([string]::IsNullOrWhiteSpace($ConfigPath) -and -not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
     $PackageConfigPath = Join-Path -Path $PSScriptRoot -ChildPath "deployment.json"
     if (Test-Path -LiteralPath $PackageConfigPath -PathType Leaf) {
         $ConfigPath = $PackageConfigPath
@@ -158,7 +179,30 @@ if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
         }
         $ZabbixAgentVersion = $Package.ZabbixAgentVersion
     }
+} else {
+    # Environment overrides let this file run interactively (or through irm | iex) without editing it.
+    $EnvironmentOverrides = [ordered]@{
+        ZABBIX_SERVER = 'DefaultServer'
+        ZABBIX_SERVER_ACTIVE = 'ServerActive'
+        ZABBIX_HOST_METADATA = 'HostMetadata'
+        ZABBIX_HOSTNAME_MODE = 'HostnameMode'
+        ZABBIX_PSK_SECRET = 'PskSecret'
+        ZABBIX_PSK_ID = 'DefaultPskId'
+        ZABBIX_LLD_SCRIPT = 'LldScript'
+        ZABBIX_CONF_PATH = 'ConfPath'
+        ZABBIX_AGENT_UNC = 'ZabbixInstallationMSI'
+    }
+    foreach ($Override in $EnvironmentOverrides.GetEnumerator()) {
+        $OverrideValue = [Environment]::GetEnvironmentVariable($Override.Key)
+        if (-not [string]::IsNullOrWhiteSpace($OverrideValue)) {
+            Set-Variable -Name $Override.Value -Value $OverrideValue
+            if ($Override.Key -ne 'ZABBIX_PSK_SECRET') {
+                Write-Log "Using $($Override.Key) override."
+            }
+        }
+    }
 }
+Remove-Item -Path Env:\ZABBIX_PSK_SECRET -ErrorAction SilentlyContinue
 
 if ($ZabbixAgentVersion -notmatch '^\d+\.\d+\.\d+$') {
     throw "ZabbixAgentVersion must look like 7.0.32."
@@ -402,4 +446,6 @@ if ($ConfigurationChanged -or $PskFileChanged) {
     Restart-Service -Name $AgentService.Name -Force -ErrorAction Stop
     Write-Log "Restarted service '$($AgentService.Name)'."
 }
-Write-Log "Deployment finished."
+$Summary = "Zabbix Agent 2 deployment succeeded. Target version: $TargetVersion; installed before run: $InstalledVersion; MSI run: $InstallRequired; configuration changed: $ConfigurationChanged; PSK changed: $PskFileChanged; hostname: $FQDN."
+Write-Log $Summary
+Write-DeploymentEvent -EntryType Information -EventId 1000 -Message $Summary

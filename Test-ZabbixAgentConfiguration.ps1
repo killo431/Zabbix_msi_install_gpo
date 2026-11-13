@@ -37,24 +37,53 @@ function Add-Check {
 $ConfigValues = @{}
 $ConfigKeys = @{}
 $ConfigReadable = $false
+
+function Read-AgentConfigFile {
+    # Parses one file and follows Include= directives (relative paths resolve from the main config folder).
+    param([string]$Path, [int]$Depth = 0)
+    if ($Depth -gt 5) {
+        throw "Include nesting is deeper than 5 levels at $Path."
+    }
+    foreach ($Line in Get-Content -LiteralPath $Path -ErrorAction Stop) {
+        if ($Line -notmatch '^\s*(?<key>[A-Za-z][A-Za-z0-9.]*)\s*=\s*(?<value>.*)$') {
+            continue
+        }
+        $Key = $Matches.key
+        $Value = $Matches.value.Trim()
+        if ($Key -eq 'Include') {
+            $IncludePath = $Value.Trim('"')
+            if (-not [IO.Path]::IsPathRooted($IncludePath)) {
+                $IncludePath = Join-Path -Path (Split-Path -Path $ConfigPath -Parent) -ChildPath $IncludePath
+            }
+            if (Test-Path -LiteralPath $IncludePath -PathType Container) {
+                $IncludedFiles = @(Get-ChildItem -LiteralPath $IncludePath -File -ErrorAction Stop)
+            } else {
+                $IncludedFiles = @(Get-ChildItem -Path $IncludePath -File -ErrorAction SilentlyContinue)
+            }
+            if ($IncludedFiles.Count -eq 0 -and $IncludePath -notmatch '[*?]') {
+                Add-Check WARN 'Configuration include' "Include target not found: $IncludePath"
+            }
+            foreach ($IncludedFile in $IncludedFiles) {
+                Read-AgentConfigFile -Path $IncludedFile.FullName -Depth ($Depth + 1)
+            }
+            continue
+        }
+        if (-not $ConfigKeys.ContainsKey($Key)) {
+            $ConfigKeys[$Key] = 0
+        }
+        $ConfigKeys[$Key]++
+        if ($Key -match '^TLSPSKValue$') {
+            $Value = '[redacted]'
+        }
+        $ConfigValues[$Key] = $Value
+    }
+}
+
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     Add-Check FAIL 'Configuration file' "Not found: $ConfigPath"
 } else {
     try {
-        foreach ($Line in Get-Content -LiteralPath $ConfigPath -ErrorAction Stop) {
-            if ($Line -match '^\s*(?<key>[A-Za-z][A-Za-z0-9]*)\s*=\s*(?<value>.*)$') {
-                $Key = $Matches.key
-                $Value = $Matches.value.Trim()
-                if (-not $ConfigKeys.ContainsKey($Key)) {
-                    $ConfigKeys[$Key] = 0
-                }
-                $ConfigKeys[$Key]++
-                if ($Key -match '^TLSPSKValue$') {
-                    $Value = '[redacted]'
-                }
-                $ConfigValues[$Key] = $Value
-            }
-        }
+        Read-AgentConfigFile -Path $ConfigPath
         $ConfigReadable = $true
         Add-Check PASS 'Configuration file' "Readable: $ConfigPath"
     } catch {
@@ -87,6 +116,9 @@ if ($ConfigReadable) {
         $Key = $Expectation.Key
         $Expected = [string]$Expectation.Expected
         if ([string]::IsNullOrWhiteSpace($Expected)) {
+            if ($Key -in @('Server', 'ServerActive')) {
+                Add-Check WARN "Config $Key" 'No expected value supplied; not verified. Pass -ExpectedServer.'
+            }
             continue
         }
         if (-not $ConfigValues.ContainsKey($Key)) {
@@ -105,12 +137,15 @@ if ($ConfigReadable) {
         }
     }
 
-    $UsesPsk = ($ConfigValues['TLSConnect'] -eq 'psk' -or $ConfigValues['TLSAccept'] -eq 'psk')
+    $TlsAcceptModes = @(([string]$ConfigValues['TLSAccept']) -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+    $UsesPsk = ($ConfigValues['TLSConnect'] -eq 'psk' -or $TlsAcceptModes -contains 'psk')
     if ($UsesPsk) {
-        if ($ConfigValues['TLSConnect'] -ne 'psk' -or $ConfigValues['TLSAccept'] -ne 'psk') {
-            Add-Check FAIL 'PSK transport' 'TLSConnect and TLSAccept must both be psk when PSK transport is used.'
+        if ($ConfigValues['TLSConnect'] -ne 'psk' -or $TlsAcceptModes -notcontains 'psk') {
+            Add-Check FAIL 'PSK transport' 'TLSConnect must be psk and TLSAccept must include psk when PSK transport is used.'
+        } elseif ($TlsAcceptModes -contains 'unencrypted') {
+            Add-Check WARN 'PSK transport' 'TLSAccept also allows unencrypted connections; remove it once all servers/proxies use PSK.'
         } else {
-            Add-Check PASS 'PSK transport' 'TLSConnect and TLSAccept are both psk.'
+            Add-Check PASS 'PSK transport' 'TLSConnect and TLSAccept use psk.'
         }
         if ([string]::IsNullOrWhiteSpace($ConfigValues['TLSPSKIdentity'])) {
             Add-Check FAIL 'PSK identity' 'TLSPSKIdentity is missing or empty.'
@@ -129,16 +164,19 @@ if ($ConfigReadable) {
 }
 
 $Service = $null
-foreach ($ServiceName in @('Zabbix Agent 2', 'Zabbix Agent2')) {
-    $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($Service) { break }
+try {
+    # Locate the service by executable so the check does not depend on the service name.
+    $Service = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop |
+        Where-Object { $_.PathName -match '(?i)zabbix_agent2\.exe' }) | Select-Object -First 1
+} catch {
+    Add-Check WARN 'Windows service' "Unable to query services: $($_.Exception.Message)"
 }
 if (-not $Service) {
-    Add-Check FAIL 'Windows service' 'Zabbix Agent 2 service was not found.'
-} elseif ($Service.Status -ne 'Running') {
-    Add-Check FAIL 'Windows service' "Service status is $($Service.Status)."
+    Add-Check FAIL 'Windows service' 'No service running zabbix_agent2.exe was found.'
+} elseif ($Service.State -ne 'Running') {
+    Add-Check FAIL 'Windows service' "Service '$($Service.Name)' state is $($Service.State)."
 } else {
-    Add-Check PASS 'Windows service' 'Zabbix Agent 2 is running.'
+    Add-Check PASS 'Windows service' "Service '$($Service.Name)' is running."
 }
 
 if (-not (Test-Path -LiteralPath $AgentExePath -PathType Leaf)) {
@@ -170,7 +208,8 @@ if (-not (Test-Path -LiteralPath $AgentExePath -PathType Leaf)) {
 if (-not $SkipNetworkCheck) {
     $ActiveTarget = [string]$ConfigValues['ServerActive']
     if ([string]::IsNullOrWhiteSpace($ActiveTarget)) { $ActiveTarget = $ExpectedServerActive }
-    $ActiveEndpoint = ($ActiveTarget -split ',')[0].Trim()
+    # ',' separates servers/proxies; ';' separates nodes of one HA cluster. Test the first node.
+    $ActiveEndpoint = (($ActiveTarget -split ',')[0] -split ';')[0].Trim()
     if ($ActiveEndpoint -match '^\[(?<host>[^\]]+)\](?::(?<port>\d+))?$') {
         $ActiveHost = $Matches.host
         $ActivePort = if ($Matches.port) { [int]$Matches.port } else { 10051 }

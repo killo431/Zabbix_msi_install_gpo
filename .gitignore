@@ -1,0 +1,6 @@
+# Generated deployment packages can contain a plaintext PSK. Never commit them.
+deployment.json
+*.msi
+*.psk
+Start-ZabbixDeployment.ps1
+logs/

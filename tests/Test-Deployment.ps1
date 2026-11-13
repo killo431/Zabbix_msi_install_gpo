@@ -1,4 +1,10 @@
+# Run from an elevated Windows PowerShell 5.1 session. Every system-changing call is mocked
+# and ProgramData/SystemRoot/TEMP are redirected to a temporary folder.
 $ErrorActionPreference = 'Stop'
+$CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $CurrentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Run the tests from an elevated PowerShell session; the installer refuses to run unelevated.'
+}
 $Repository = Split-Path $PSScriptRoot -Parent
 $Installer = Join-Path $Repository 'install_agent2_gpo.ps1'
 
@@ -73,6 +79,11 @@ function Copy-Item {
 function Invoke-WebRequest {
     [CmdletBinding()]
     param($Uri, $OutFile, [switch]$UseBasicParsing)
+    if (-not $OutFile) {
+        $TestState.TemplateDownloads++
+        $TestState.TemplateUri = $Uri
+        return [pscustomobject]@{ Content = (Get-Content -LiteralPath $Installer -Raw) }
+    }
     $TestState.DownloadCalls++
     if (-not $TestState.AllowDownload) { throw 'Unexpected MSI download.' }
     if ($TestState.DownloadFails) { throw [IO.IOException]::new('Test HTTPS download failed.') }
@@ -84,10 +95,21 @@ function Get-CimInstance {
     if ($ClassName -eq 'Win32_Service') {
         return @(
             [pscustomobject]@{ Name = 'Unrelated'; PathName = 'C:\Windows\System32\svchost.exe -k netsvcs' }
-            [pscustomobject]@{ Name = 'Zabbix Agent 2'; PathName = '"C:\Program Files\Zabbix Agent 2\zabbix_agent2.exe" -c "C:\Program Files\Zabbix Agent 2\zabbix_agent2.conf"' }
+            [pscustomobject]@{ Name = 'Zabbix Agent 2'; State = 'Running'; PathName = '"C:\Program Files\Zabbix Agent 2\zabbix_agent2.exe" -c "C:\Program Files\Zabbix Agent 2\zabbix_agent2.conf"' }
         )
     }
     [pscustomobject]@{ DNSHostName = 'testhost'; Domain = 'example.com'; PartOfDomain = $true }
+}
+function New-EventLog { param($LogName, $Source, $ErrorAction) }
+function Write-EventLog {
+    param($LogName, $Source, $EventId, $EntryType, $Message, $ErrorAction)
+    $TestState.Events += "$EntryType/$EventId"
+    $TestState.EventMessages += $Message
+}
+function Get-AuthenticodeSignature {
+    param($LiteralPath, $ErrorAction)
+    $Subject = if ($TestState.SignatureValid) { 'CN=Zabbix SIA, O=Zabbix SIA, L=Riga, C=LV' } else { 'CN=Someone Else, O=Someone Else' }
+    [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = $Subject } }
 }
 function Test-NetConnection { param($ComputerName, $Port, $InformationLevel, $WarningAction) $true }
 
@@ -113,6 +135,10 @@ try {
         Sleeps = 0
         AclOwner = 'S-1-5-18'
         AclPaths = @()
+        Events = @()
+        EventMessages = @()
+        SignatureValid = $true
+        TemplateDownloads = 0
     }
     $Checker = Join-Path $Repository 'Test-ZabbixAgentConfiguration.ps1'
     $FakeAgent = Join-Path $TestRoot 'zabbix_agent2.exe'
@@ -137,6 +163,32 @@ try {
     Assert-True (($HealthSummary | Out-String) -notmatch 'DO-NOT-LEAK-THIS-PSK') 'Health-check output must not leak PSK data.'
     $BadHealthSummary = & $Checker -ConfigPath $HealthConfig -AgentExePath $FakeAgent -ExpectedServer '172.17.6.24' -ExpectedServerActive 'wrong.example.com' -SkipAgentConfigTest -SkipNetworkCheck
     Assert-True ($BadHealthSummary.ExitCode -eq 1) 'A mismatched ServerActive must fail the health check.'
+
+    # Include= files are read, TLSAccept lists are accepted, and duplicates across includes fail.
+    $IncludeDirectory = Join-Path $TestRoot 'health.d'
+    New-Item -ItemType Directory -Path $IncludeDirectory | Out-Null
+    $IncludeConfig = Join-Path $TestRoot 'include.conf'
+    @(
+        'Server=172.17.6.24'
+        'ServerActive=zbx01.example.com;zbx02.example.com'
+        'Hostname=testhost.example.com'
+        'HostMetadata=GAS;windows;ADC;server'
+        'Include=health.d\*.conf'
+    ) | Set-Content -LiteralPath $IncludeConfig
+    @(
+        'TLSConnect=psk'
+        'TLSAccept=unencrypted,psk'
+        'TLSPSKIdentity=ZabbixPSK'
+        "TLSPSKFile=$PskFile"
+    ) | Set-Content -LiteralPath (Join-Path $IncludeDirectory 'tls.conf')
+    $IncludeSummary = & $Checker -ConfigPath $IncludeConfig -AgentExePath $FakeAgent -ExpectedServer '172.17.6.24' -ExpectedServerActive 'zbx01.example.com;zbx02.example.com' -SkipAgentConfigTest
+    Assert-True ($IncludeSummary.ExitCode -eq 0) 'Settings in included files must be honored.'
+    Assert-True (@($IncludeSummary.Checks | Where-Object { $_.Check -eq 'PSK transport' -and $_.Status -eq 'WARN' }).Count -eq 1) 'TLSAccept allowing unencrypted must warn, not fail.'
+    Assert-True (@($IncludeSummary.Checks | Where-Object { $_.Check -eq 'Active server network' -and $_.Detail -match 'zbx01\.example\.com:10051' }).Count -eq 1) 'Only the first HA node must be tested.'
+    'Server=10.0.0.1' | Set-Content -LiteralPath (Join-Path $IncludeDirectory 'dup.conf')
+    $DuplicateSummary = & $Checker -ConfigPath $IncludeConfig -AgentExePath $FakeAgent -SkipAgentConfigTest -SkipNetworkCheck
+    Assert-True (@($DuplicateSummary.Checks | Where-Object { $_.Check -eq 'Duplicate Server' }).Count -eq 1) 'Duplicates across included files must fail.'
+    Assert-True (@($DuplicateSummary.Checks | Where-Object { $_.Check -eq 'Config Server' -and $_.Status -eq 'WARN' }).Count -eq 1) 'A missing expected server must warn.'
 
     $MsiPath = Join-Path $TestRoot 'agent.msi'
     Set-Content -LiteralPath $MsiPath -Value 'test MSI content'
@@ -181,6 +233,7 @@ try {
     Assert-True (Test-Path (Join-Path $TestRoot 'scripts/lld.ps1')) 'The packaged LLD script must be copied.'
     Assert-True ($TestState.RestartCalls -eq 1) 'Configuration changes must restart the agent.'
     Assert-True ($TestState.RestartedService -eq 'Zabbix Agent 2') 'The agent service must be found by its executable path.'
+    Assert-True ($TestState.Events[-1] -eq 'Information/1000') 'A successful run must write event 1000.'
 
     $TestState.InstalledVersion = '7.0.32'
     & $Installer -ConfigPath $ConfigPath
@@ -260,6 +313,7 @@ try {
     Assert-True ($TestState.InstallCalls -eq 5 -and $TestState.Sleeps -eq 1) 'Exit code 1618 must be retried after a delay.'
     $TestState.MsiExitCodes = @(1603)
     Assert-Fails { & $Installer -ConfigPath $ConfigPath } 'exit code 1603'
+    Assert-True ($TestState.Events[-1] -eq 'Error/1001') 'A failed run must write event 1001.'
     Assert-True ($TestState.InstallCalls -eq 6) 'A hard MSI failure must not be retried.'
 
     $Package.ZabbixInstallationMSI = 'missing.msi'
@@ -289,8 +343,43 @@ try {
     $Package.LldScript = 'missing-lld.ps1'
     Save-Package
     Assert-Fails { & $Installer -ConfigPath $ConfigPath } 'LLD script file not found'
+
+    # Standalone/interactive mode: environment overrides, signature verification, and the irm | iex wrapper.
+    $TestState.InstalledVersion = ''
+    $TestState.DownloadFails = $false
+    $TestState.DownloadContent = 'test MSI content'
+    $env:ZABBIX_SERVER = 'env-zabbix.example.com'
+    $env:ZABBIX_SERVER_ACTIVE = 'env-proxy.example.com'
+    $env:ZABBIX_CONF_PATH = $TestState.AgentConfig
+    $env:ZABBIX_AGENT_UNC = $MsiPath
+    $env:ZABBIX_PSK_SECRET = 'ffeeddccbbaa99887766554433221100'
+    $env:ZABBIX_PSK_ID = 'EnvIdentity'
+    $InstallCallsBefore = $TestState.InstallCalls
+    & $Installer
+    Assert-True ($TestState.InstallCalls -eq $InstallCallsBefore + 1) 'Standalone mode must install from ZABBIX_AGENT_UNC.'
+    Assert-True ((Get-Content $TestState.AgentConfig) -contains 'Server=env-zabbix.example.com') 'ZABBIX_SERVER must override the default server.'
+    Assert-True ((Get-Content $TestState.AgentConfig) -contains 'TLSPSKIdentity=EnvIdentity') 'ZABBIX_PSK_ID must be applied.'
+    Assert-True (-not (Test-Path Env:\ZABBIX_PSK_SECRET)) 'ZABBIX_PSK_SECRET must be cleared after use.'
+    Assert-True (-not (($TestState.EventMessages -join "`n") -match 'ffeeddccbbaa99887766554433221100')) 'Events must not contain the PSK.'
+
+    Remove-Item -Path Env:\ZABBIX_PSK_ID
+    $TestState.SignatureValid = $false
+    Assert-Fails { & $Installer } 'valid Zabbix SIA Authenticode signature'
+    $TestState.SignatureValid = $true
+
+    $env:ZABBIX_SERVER = 'template-zabbix.example.com'
+    $env:ZABBIX_SCRIPT_REF = 'v1.2.3'
+    & (Join-Path $Repository 'install_agent2_template.ps1')
+    Assert-True ($TestState.TemplateDownloads -eq 1) 'The template must download the GPO installer.'
+    Assert-True ($TestState.TemplateUri -eq 'https://raw.githubusercontent.com/killo431/Zabbix_msi_install_gpo/v1.2.3/install_agent2_gpo.ps1') 'The template must honor ZABBIX_SCRIPT_REF.'
+    Assert-True ((Get-Content $TestState.AgentConfig) -contains 'Server=template-zabbix.example.com') 'The template must run the installer with environment overrides.'
+    $env:ZABBIX_SCRIPT_REF = 'main;bad'
+    Assert-Fails { & (Join-Path $Repository 'install_agent2_template.ps1') } 'unsupported characters'
     Write-Output 'Deployment checks passed.'
 } finally {
+    foreach ($Name in @('ZABBIX_SERVER', 'ZABBIX_SERVER_ACTIVE', 'ZABBIX_CONF_PATH', 'ZABBIX_AGENT_UNC', 'ZABBIX_PSK_SECRET', 'ZABBIX_PSK_ID', 'ZABBIX_SCRIPT_REF')) {
+        Remove-Item -Path "Env:\$Name" -ErrorAction SilentlyContinue
+    }
     $env:ProgramData = $PreviousProgramData
     $env:SystemRoot = $PreviousSystemRoot
     $env:TEMP = $PreviousTemp

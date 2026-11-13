@@ -1,231 +1,40 @@
-##This script is used to install and update zabbix agent version 2 via GPO
+##Interactive Zabbix Agent 2 setup through irm | iex.
+##Original author: https://github.com/Padl3xx
 #
-##Author: https://github.com/Padl3xx
+##This wrapper keeps the published irm URL working. All installation logic lives in
+##install_agent2_gpo.ps1 so the GPO and interactive paths cannot drift apart.
 #
-##For an elevated interactive PowerShell setup, set ZABBIX_SERVER and run:
-##irm https://raw.githubusercontent.com/killo431/Zabbix_msi_install_gpo/main/install_agent2_template.ps1 | iex
-##The script can also be deployed as a computer startup GPO script.
+##In an elevated PowerShell session:
+##  $env:ZABBIX_SERVER = "zabbix.example.com"
+##  $env:ZABBIX_SCRIPT_REF = "<release tag or commit SHA>"   # recommended: pin what you run
+##  irm https://raw.githubusercontent.com/killo431/Zabbix_msi_install_gpo/main/install_agent2_template.ps1 | iex
+#
+##Other overrides: ZABBIX_SERVER_ACTIVE, ZABBIX_HOST_METADATA, ZABBIX_HOSTNAME_MODE, ZABBIX_PSK_SECRET,
+##ZABBIX_PSK_ID, ZABBIX_LLD_SCRIPT, ZABBIX_CONF_PATH, ZABBIX_AGENT_UNC. ZABBIX_PSK_SECRET is cleared after use.
 
-# User-configurable variables
-$ZabbixMsiUrl = "https://github.com/killo431/packages/releases/download/main/zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
-$ZabbixAgentVersion = "7.0.32"
-$ServerActive = ""
-$HostMetadata = "GAS;windows;ADC;server"
-$HostnameMode = "FQDN"
-$AgentUnc = "\\gas-fil004\packages\Zabbix Agent 2\zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
-$PskSecret = ""
-$DefaultPskId = ""
-$DefaultServer = "172.17.6.24"
-$LldScript = ""
-$ConfPath = "C:\Program Files\Zabbix Agent 2\zabbix_agent2.conf"
-
-# Environment overrides allow this file to run through irm | iex without editing it first.
-if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_SERVER)) { $DefaultServer = $env:ZABBIX_SERVER }
-if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_SERVER_ACTIVE)) { $ServerActive = $env:ZABBIX_SERVER_ACTIVE }
-if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_HOST_METADATA)) { $HostMetadata = $env:ZABBIX_HOST_METADATA }
-if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_HOSTNAME_MODE)) { $HostnameMode = $env:ZABBIX_HOSTNAME_MODE }
-if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_PSK_SECRET)) { $PskSecret = $env:ZABBIX_PSK_SECRET }
-if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_PSK_ID)) { $DefaultPskId = $env:ZABBIX_PSK_ID }
-if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_LLD_SCRIPT)) { $LldScript = $env:ZABBIX_LLD_SCRIPT }
-if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_CONF_PATH)) { $ConfPath = $env:ZABBIX_CONF_PATH }
-if (-not [string]::IsNullOrWhiteSpace($env:ZABBIX_AGENT_UNC)) { $AgentUnc = $env:ZABBIX_AGENT_UNC }
-Remove-Item Env:\ZABBIX_PSK_SECRET -ErrorAction SilentlyContinue
-
-$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
-if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw "Run this setup from an elevated PowerShell session."
-}
-
-if ([string]::IsNullOrWhiteSpace($DefaultServer)) {
-    throw "Set DefaultServer or the ZABBIX_SERVER environment variable to the Zabbix server or proxy address."
-}
-if ([string]::IsNullOrWhiteSpace($ServerActive)) { $ServerActive = $DefaultServer }
-if ([string]::IsNullOrWhiteSpace($HostMetadata) -or $HostMetadata -match '[\r\n"]') {
-    throw "Set HostMetadata to the expected GAS metadata string."
-}
-if ($HostnameMode -notin @('FQDN', 'GAS')) { throw "HostnameMode must be FQDN or GAS." }
-if ([string]::IsNullOrWhiteSpace($PskSecret) -xor [string]::IsNullOrWhiteSpace($DefaultPskId)) {
-    throw "Set both PskSecret and DefaultPskId, or leave both empty."
-}
-if (-not [string]::IsNullOrWhiteSpace($PskSecret) -and $PskSecret -notmatch '^[0-9A-Fa-f]+$') {
-    throw "PskSecret must contain only hexadecimal characters."
-}
-if ((Split-Path -Path $ConfPath -Leaf) -ine "zabbix_agent2.conf") {
-    throw "ConfPath must end with zabbix_agent2.conf so the MSI and agent use the same configuration file."
-}
-if (-not [string]::IsNullOrWhiteSpace($LldScript) -and -not (Test-Path -LiteralPath $LldScript -PathType Leaf)) {
-    throw "LLD script file not found: $LldScript"
-}
-
-$InstallFolder = Split-Path -Path $ConfPath -Parent
-$PskDirectory = Join-Path -Path $env:ProgramData -ChildPath "ZabbixAgent2"
-$PskFilePath = Join-Path -Path $PskDirectory -ChildPath "zabbix_agent2.psk"
-$PskFileChanged = $false
-
-if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
-    if (($PskSecret.Length % 2) -ne 0) {
-        throw "PskSecret must contain an even number of hexadecimal characters."
+& {
+    $ErrorActionPreference = 'Stop'
+    $Ref = $env:ZABBIX_SCRIPT_REF
+    if ([string]::IsNullOrWhiteSpace($Ref)) {
+        $Ref = 'main'
+        Write-Warning "ZABBIX_SCRIPT_REF is not set; running the installer from the main branch. Pin a tag or commit SHA in production."
     }
-    New-Item -ItemType Directory -Path $PskDirectory -Force -ErrorAction Stop | Out-Null
-    & "$env:SystemRoot\System32\icacls.exe" $PskDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to secure the PSK directory: $PskDirectory"
+    if ($Ref -notmatch '^[A-Za-z0-9._/-]+$') {
+        throw "ZABBIX_SCRIPT_REF contains unsupported characters."
     }
-    if (-not (Test-Path -LiteralPath $PskFilePath -PathType Leaf)) {
-        [System.IO.File]::WriteAllText($PskFilePath, "", [System.Text.Encoding]::ASCII)
+    $InstallerUrl = "https://raw.githubusercontent.com/killo431/Zabbix_msi_install_gpo/$Ref/install_agent2_gpo.ps1"
+    $PreviousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+    $PreviousProgressPreference = $ProgressPreference
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
+        $InstallerSource = (Invoke-WebRequest -Uri $InstallerUrl -UseBasicParsing).Content
+    } finally {
+        [Net.ServicePointManager]::SecurityProtocol = $PreviousSecurityProtocol
+        $ProgressPreference = $PreviousProgressPreference
     }
-    & "$env:SystemRoot\System32\icacls.exe" $PskFilePath /inheritance:r /grant:r '*S-1-5-18:(R)' '*S-1-5-32-544:(F)' | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to secure the PSK file: $PskFilePath"
+    if ($InstallerSource -isnot [string] -or $InstallerSource -notmatch 'Zabbix Agent 2 silent installer') {
+        throw "Downloaded content from $InstallerUrl is not the Zabbix installer."
     }
-    $PreviousPskSecret = [System.IO.File]::ReadAllText($PskFilePath)
-    $PskFileChanged = $PreviousPskSecret -cne $PskSecret
-    if ($PskFileChanged) {
-        [System.IO.File]::WriteAllText($PskFilePath, $PskSecret, [System.Text.Encoding]::ASCII)
-    }
-} elseif (Test-Path -LiteralPath $PskFilePath -PathType Leaf) {
-    Remove-Item -LiteralPath $PskFilePath -Force -ErrorAction Stop
-    $PskFileChanged = $true
-}
-
-# Construct the FQDN (Fully Qualified Domain Name) of the local computer
-$ComputerSystem = Get-WmiObject -Class Win32_ComputerSystem
-$FQDN = if ($HostnameMode -eq 'GAS') {
-    "GAS-$($ComputerSystem.DNSHostName)"
-} else {
-    $ComputerSystem.DNSHostName + "." + $ComputerSystem.Domain
-}
-
-$ZabbixSoftwareName = "Zabbix Agent 2 (64-bit)"
-$InstalledZabbixVersion = (Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -eq $ZabbixSoftwareName }).Version
-$InstalledVersion = [version]"0.0.0"
-if (-not [string]::IsNullOrWhiteSpace($InstalledZabbixVersion)) {
-    if ($InstalledZabbixVersion -match '^\d+\.\d+\.\d+') {
-        $InstalledVersion = [version]$Matches[0]
-    } else {
-        throw "Unable to determine the installed Zabbix Agent 2 version: $InstalledZabbixVersion"
-    }
-}
-
-$TargetVersion = [version]$ZabbixAgentVersion
-$ConfigExists = Test-Path -LiteralPath $ConfPath -PathType Leaf
-$InstallRequired = $InstalledVersion -lt $TargetVersion
-if (-not $ConfigExists) {
-    if ($InstalledVersion -gt $TargetVersion) {
-        throw "ConfPath does not exist and the installed agent is newer than the configured MSI; refusing to downgrade. Check ConfPath."
-    }
-    $InstallRequired = $true
-}
-
-if ($InstallRequired) {
-    $MsiPath = Join-Path -Path $env:TEMP -ChildPath "zabbix_agent2-$ZabbixAgentVersion-windows-amd64-openssl.msi"
-    $MsiCopied = $false
-    if (-not [string]::IsNullOrWhiteSpace($AgentUnc)) {
-        try {
-            Copy-Item -LiteralPath $AgentUnc -Destination $MsiPath -Force -ErrorAction Stop
-            $MsiCopied = $true
-        } catch [IO.IOException], [UnauthorizedAccessException], [Management.Automation.ItemNotFoundException], [Management.Automation.DriveNotFoundException] {
-            Write-Warning "Cannot stage MSI from $AgentUnc; using the HTTPS fallback. $($_.Exception.Message)"
-        }
-    }
-    if (-not $MsiCopied) {
-        $PreviousProgressPreference = $ProgressPreference
-        $PreviousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
-        try {
-            $ProgressPreference = 'SilentlyContinue'
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $ZabbixMsiUrl -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop | Out-Null
-        } finally {
-            $ProgressPreference = $PreviousProgressPreference
-            [Net.ServicePointManager]::SecurityProtocol = $PreviousSecurityProtocol
-        }
-    }
-    if (-not (Test-Path -LiteralPath $MsiPath -PathType Leaf) -or (Get-Item -LiteralPath $MsiPath).Length -eq 0) {
-        throw "The staged Zabbix MSI is missing or empty: $MsiPath"
-    }
-    $Signature = Get-AuthenticodeSignature -LiteralPath $MsiPath -ErrorAction Stop
-    if ($Signature.Status -ne 'Valid' -or $Signature.SignerCertificate.Subject -notmatch 'O="?Zabbix SIA"?(,|$)') {
-        throw "The staged MSI must have a valid Zabbix SIA Authenticode signature."
-    }
-
-    $MsiProperties = @(
-        "SERVER=$DefaultServer"
-        "SERVERACTIVE=$ServerActive"
-        "HOSTMETADATA=$HostMetadata"
-        "HOSTNAME=$FQDN"
-        "LOGFILESIZE=20"
-        "DEBUGLEVEL=3"
-        ('INSTALLFOLDER="{0}"' -f $InstallFolder)
-        "IGNOREALREADYEXISTSFOLDER=1"
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
-        $MsiProperties += @(
-            "TLSCONNECT=psk"
-            "TLSACCEPT=psk"
-            ('TLSPSKIDENTITY="{0}"' -f $DefaultPskId)
-            ('TLSPSKFILE="{0}"' -f $PskFilePath)
-        )
-    }
-
-    $MsiArguments = '/i "{0}" {1} /qn' -f $MsiPath, ($MsiProperties -join ' ')
-    $MsiProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $MsiArguments -WindowStyle Hidden -Wait -PassThru
-    if ($MsiProcess.ExitCode -notin @(0, 3010)) {
-        throw "Zabbix Agent 2 MSI installation failed with exit code $($MsiProcess.ExitCode)."
-    }
-}
-
-if (-not (Test-Path -LiteralPath $ConfPath -PathType Leaf)) {
-    throw "The agent configuration file was not created at ConfPath: $ConfPath"
-}
-
-$Configuration = [ordered]@{
-    Server = $DefaultServer
-    ServerActive = $ServerActive
-    HostMetadata = $HostMetadata
-    Hostname = $FQDN
-    LogFileSize = "20"
-    DebugLevel = "3"
-}
-$ManagedPattern = '^\s*#?\s*(Server|ServerActive|HostMetadata|Hostname|LogFileSize|DebugLevel)\s*='
-$ConfigLines = @(Get-Content -LiteralPath $ConfPath -ErrorAction Stop | Where-Object { $_ -notmatch $ManagedPattern })
-
-if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
-    $TlsPattern = '^\s*#?\s*(TLSConnect|TLSAccept|TLSPSKIdentity|TLSPSKFile|TLSPSKValue)\s*='
-    $ConfigLines = @($ConfigLines | Where-Object { $_ -notmatch $TlsPattern })
-    $Configuration['TLSConnect'] = "psk"
-    $Configuration['TLSAccept'] = "psk"
-    $Configuration['TLSPSKIdentity'] = $DefaultPskId
-    $Configuration['TLSPSKFile'] = $PskFilePath
-} else {
-    $ConfigLines = @($ConfigLines | Where-Object {
-        $_ -notmatch '^\s*#?\s*TLSPSK(Identity|File|Value)\s*=' -and
-        $_ -notmatch '^\s*#?\s*TLS(Connect|Accept)\s*=\s*psk\s*$'
-    })
-}
-
-foreach ($Key in $Configuration.Keys) {
-    $ConfigLines += "$Key=$($Configuration[$Key])"
-}
-$NewConfigContent = ($ConfigLines -join "`r`n") + "`r`n"
-$OldConfigContent = [System.IO.File]::ReadAllText($ConfPath)
-$ConfigurationChanged = $OldConfigContent -cne $NewConfigContent
-if ($ConfigurationChanged) {
-    $Utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
-    [System.IO.File]::WriteAllText($ConfPath, $NewConfigContent, $Utf8NoBom)
-}
-
-if (-not [string]::IsNullOrWhiteSpace($LldScript)) {
-    $ScriptsFolder = Join-Path -Path $InstallFolder -ChildPath "scripts"
-    New-Item -ItemType Directory -Path $ScriptsFolder -Force -ErrorAction Stop | Out-Null
-    Copy-Item -LiteralPath $LldScript -Destination $ScriptsFolder -Force -ErrorAction Stop
-}
-
-if ($ConfigurationChanged -or $PskFileChanged) {
-    $AgentService = Get-Service -Name "Zabbix Agent2" -ErrorAction SilentlyContinue
-    if ($null -eq $AgentService) {
-        throw "Agent configuration changed, but the Zabbix Agent2 service was not found."
-    }
-    Restart-Service -Name "Zabbix Agent2" -Force -ErrorAction Stop
+    & ([scriptblock]::Create($InstallerSource))
 }
