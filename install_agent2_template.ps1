@@ -6,117 +6,154 @@
 ##Create a new GPO, go to, Computer Configuration -> Policies -> Windows Settings -> Scripts -> Startup -> Powershell Scripts -> Add.
 ##Dont forget to link the GPO on specified OU :-)
 ##It should probably work if you run the installation directly from your computer, but I haven't tried that.
-#
-# Construct the FQDN (Fully Qualified Domain Name) of the local computer
-$FQDN=(Get-WmiObject win32_computersystem).DNSHostName+"."+(Get-WmiObject win32_computersystem).Domain
 
-
-#User-configurable variables
-$ZabbixInstallationMSI = "\\yourdomain.com\NETLOGON\ZabbixAgent2\zabbix_agent2-7.0.9-windows-amd64-openssl.msi"
-$ZabbixAgentVersion = "7.0.9"
+# User-configurable variables
+$ZabbixMsiUrl = "https://github.com/killo431/packages/releases/download/main/zabbix_agent2-7.0.32-windows-amd64-openssl.msi"
+$ZabbixAgentVersion = "7.0.32"
 $PskSecret = ""
 $DefaultPskId = ""
-$DefaultServer = "8.8.8.8"
+$DefaultServer = ""
 $LldScript = ""
 $ConfPath = "C:\Program Files\Zabbix Agent 2\zabbix_agent2.conf"
-#$ZabbixInstallationFolder = "\\$FQDN\c$\Program Files\Zabbix Agent 2\"
-#$ZabbixPluginFolder = "\\yourdomain.com\NETLOGON\ZabbixAgent2\zabbix_agent2.d\"
-#$ZabbixScriptsFolder = "\\yourdomain.com\NETLOGON\ZabbixAgent2\scripts"
 
+if ([string]::IsNullOrWhiteSpace($DefaultServer)) {
+    throw "Set DefaultServer to the Zabbix server or proxy address before deployment."
+}
 if ([string]::IsNullOrWhiteSpace($PskSecret) -xor [string]::IsNullOrWhiteSpace($DefaultPskId)) {
     throw "Set both PskSecret and DefaultPskId, or leave both empty."
 }
-
-# Be careful what you change here
-
-if (get-service -Name "Zabbix Agent2") { 
-Stop-Service -Name "Zabbix Agent2" -Force
-sc.exe stop "Zabbix Agent2"
-Start-Sleep -s 1
-Remove-Item C:\Zabbix -Recurse -Force
-sc.exe delete "Zabbix Agent2"
+if (-not [string]::IsNullOrWhiteSpace($PskSecret) -and $PskSecret -notmatch '^[0-9A-Fa-f]+$') {
+    throw "PskSecret must contain only hexadecimal characters."
 }
+if ((Split-Path -Path $ConfPath -Leaf) -ine "zabbix_agent2.conf") {
+    throw "ConfPath must end with zabbix_agent2.conf so the MSI and agent use the same configuration file."
+}
+if (-not [string]::IsNullOrWhiteSpace($LldScript) -and -not (Test-Path -LiteralPath $LldScript -PathType Leaf)) {
+    throw "LLD script file not found: $LldScript"
+}
+
+$InstallFolder = Split-Path -Path $ConfPath -Parent
+$PskDirectory = Join-Path -Path $env:ProgramData -ChildPath "ZabbixAgent2"
+$PskFilePath = Join-Path -Path $PskDirectory -ChildPath "zabbix_agent2.psk"
+
+# Construct the FQDN (Fully Qualified Domain Name) of the local computer
+$ComputerSystem = Get-WmiObject -Class Win32_ComputerSystem
+$FQDN = $ComputerSystem.DNSHostName + "." + $ComputerSystem.Domain
 
 $ZabbixSoftwareName = "Zabbix Agent 2 (64-bit)"
 $InstalledZabbixVersion = (Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -eq $ZabbixSoftwareName }).Version
-
-# Extract the major version from the installed version
-$InstalledVersion = $InstalledZabbixVersion -replace "(\d+\.\d+\.\d+).*", '$1'
-
-$Arguments = @(
-    "SERVER=$DefaultServer"
-    "HOSTMETADATA=Windows"
-    "HOSTNAME=$FQDN"
-    "LOGFILESIZE=20"
-    "DEBUGLEVEL=3"
-)
-if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
-    $Arguments += "TLSPSKIDENTITY=$DefaultPskId"
-    $Arguments += "TLSPSKVALUE=$PskSecret"
-}
-$Arguments += "/qn"
-
-if ([System.Version]$InstalledVersion -lt [System.Version]$ZabbixAgentVersion) {
-    # The installed version is different from the desired version, so perform the installation or update
-
-    if (Test-Path $ZabbixInstallationMSI) {
-        # The installation file is available, so start the installation process
-		Start-Process -FilePath "$ZabbixInstallationMSI" -ArgumentList ($Arguments -join ' ') -Wait
-	Start-Sleep -s 1	
-	#if (Test-Path $ConfPath) {
-	#(Get-Content $ConfPath) -replace '^(#?\s*LogFileSize=.*)', 'LogFileSize=20' |
-    #ForEach-Object {$_ -replace '^(#?\s*DebugLevel=.*)', 'DebugLevel=3'} |
-    #ForEach-Object {$_ -replace '^(ServerActive=.*)', '#ServerActive='} |
-    #Set-Content $ConfPath -Force
-	#} else {
-    #"[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Error: File $ConfPath does not exist!" | Set-Content $FailLog -Force
-	#}
-		#Copy-Item -Path @($ZabbixPluginFolder, $ZabbixScriptsFolder) -Destination $ZabbixInstallationFolder -Force -Recurse
+$InstalledVersion = [version]"0.0.0"
+if (-not [string]::IsNullOrWhiteSpace($InstalledZabbixVersion)) {
+    if ($InstalledZabbixVersion -match '^\d+\.\d+\.\d+') {
+        $InstalledVersion = [version]$Matches[0]
     } else {
-        # The installation file is not available, exit the script
-        exit
+        throw "Unable to determine the installed Zabbix Agent 2 version: $InstalledZabbixVersion"
+    }
+}
+
+$TargetVersion = [version]$ZabbixAgentVersion
+$ConfigExists = Test-Path -LiteralPath $ConfPath -PathType Leaf
+$InstallRequired = $InstalledVersion -lt $TargetVersion
+if (-not $ConfigExists) {
+    if ($InstalledVersion -gt $TargetVersion) {
+        throw "ConfPath does not exist and the installed agent is newer than the configured MSI; refusing to downgrade. Check ConfPath."
+    }
+    $InstallRequired = $true
+}
+
+if ($InstallRequired) {
+    $MsiPath = Join-Path -Path $env:TEMP -ChildPath "zabbix_agent2-$ZabbixAgentVersion-windows-amd64-openssl.msi"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $ZabbixMsiUrl -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath $MsiPath -PathType Leaf) -or (Get-Item -LiteralPath $MsiPath).Length -eq 0) {
+        throw "The Zabbix MSI download failed or produced an empty file: $ZabbixMsiUrl"
     }
 
+    $MsiProperties = @(
+        "SERVER=$DefaultServer"
+        "HOSTMETADATA=Windows"
+        "HOSTNAME=$FQDN"
+        "LOGFILESIZE=20"
+        "DEBUGLEVEL=3"
+        ('INSTALLFOLDER="{0}"' -f $InstallFolder)
+        "IGNOREALREADYEXISTSFOLDER=1"
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
+        if (($PskSecret.Length % 2) -ne 0) {
+            throw "PskSecret must contain an even number of hexadecimal characters."
+        }
+        New-Item -ItemType Directory -Path $PskDirectory -Force -ErrorAction Stop | Out-Null
+        & "$env:SystemRoot\System32\icacls.exe" $PskDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to secure the PSK directory: $PskDirectory"
+        }
+        if (-not (Test-Path -LiteralPath $PskFilePath -PathType Leaf)) {
+            [System.IO.File]::WriteAllText($PskFilePath, "", [System.Text.Encoding]::ASCII)
+        }
+        & "$env:SystemRoot\System32\icacls.exe" $PskFilePath /inheritance:r /grant:r '*S-1-5-18:(R)' '*S-1-5-32-544:(F)' | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to secure the PSK file: $PskFilePath"
+        }
+        [System.IO.File]::WriteAllText($PskFilePath, $PskSecret, [System.Text.Encoding]::ASCII)
+
+        $MsiProperties += @(
+            "TLSCONNECT=psk"
+            "TLSACCEPT=psk"
+            ('TLSPSKIDENTITY="{0}"' -f $DefaultPskId)
+            ('TLSPSKFILE="{0}"' -f $PskFilePath)
+        )
+    }
+
+    $MsiArguments = '/i "{0}" {1} /qn' -f $MsiPath, ($MsiProperties -join ' ')
+    $MsiProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $MsiArguments -Wait -PassThru
+    if ($MsiProcess.ExitCode -notin @(0, 3010)) {
+        throw "Zabbix Agent 2 MSI installation failed with exit code $($MsiProcess.ExitCode)."
+    }
+}
+
+if (-not (Test-Path -LiteralPath $ConfPath -PathType Leaf)) {
+    throw "The agent configuration file was not created at ConfPath: $ConfPath"
+}
+
+$Configuration = [ordered]@{
+    Server = $DefaultServer
+    HostMetadata = "Windows"
+    Hostname = $FQDN
+    LogFileSize = "20"
+    DebugLevel = "3"
+}
+if (-not [string]::IsNullOrWhiteSpace($PskSecret)) {
+    $Configuration.TLSConnect = "psk"
+    $Configuration.TLSAccept = "psk"
+    $Configuration.TLSPSKIdentity = $DefaultPskId
+    $Configuration.TLSPSKFile = $PskFilePath
+}
+
+$ManagedKeys = @($Configuration.Keys)
+$ManagedPattern = '^\s*#?\s*(' + (($ManagedKeys | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')\s*='
+$ConfigLines = @(Get-Content -LiteralPath $ConfPath -ErrorAction Stop | Where-Object { $_ -notmatch $ManagedPattern })
+foreach ($Key in $Configuration.Keys) {
+    $ConfigLines += "$Key=$($Configuration[$Key])"
+}
+$NewConfigContent = ($ConfigLines -join "`r`n") + "`r`n"
+$OldConfigContent = [System.IO.File]::ReadAllText($ConfPath)
+$ConfigurationChanged = $OldConfigContent -cne $NewConfigContent
+if ($ConfigurationChanged) {
+    $Utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+    [System.IO.File]::WriteAllText($ConfPath, $NewConfigContent, $Utf8NoBom)
 }
 
 if (-not [string]::IsNullOrWhiteSpace($LldScript)) {
-    if (-not (Test-Path -LiteralPath $LldScript -PathType Leaf)) {
-        throw "LLD script file not found: $LldScript"
-    }
-
-    $ScriptsFolder = Join-Path -Path (Split-Path -Path $ConfPath -Parent) -ChildPath "scripts"
-    New-Item -ItemType Directory -Path $ScriptsFolder -Force | Out-Null
-    Copy-Item -LiteralPath $LldScript -Destination $ScriptsFolder -Force
+    $ScriptsFolder = Join-Path -Path $InstallFolder -ChildPath "scripts"
+    New-Item -ItemType Directory -Path $ScriptsFolder -Force -ErrorAction Stop | Out-Null
+    Copy-Item -LiteralPath $LldScript -Destination $ScriptsFolder -Force -ErrorAction Stop
 }
 
-## Function to update plugin and scripts folders if changes are detected
-#if (!(Test-Path -Path "$(Split-Path -Path $ConfPath -Parent)\zabbix_agent2.d" -PathType Container)) {
-##if not exist, folder is created
-#    New-Item -ItemType Directory -Path "$(Split-Path -Path $ConfPath -Parent)\zabbix_agent2.d" -Force
-#}
-#
-#if (!(Test-Path -Path "$(Split-Path -Path $ConfPath -Parent)\scripts" -PathType Container)) {
-##if not exist, folder is created
-#    New-Item -ItemType Directory -Path "$(Split-Path -Path $ConfPath -Parent)\scripts" -Force
-#}
-#
-## Function to synchronize files of specified folders
-#function Sync-Folder {
-#    param(
-#        [string]$sourceFolder,
-#        [string]$destinationFolder
-#    )
-#    
-#    $sourceFiles = Get-ChildItem -Path $sourceFolder -File
-#    foreach ($file in $sourceFiles) {
-#        $destinationFile = Join-Path -Path $destinationFolder -ChildPath $file.Name
-#        if (!(Test-Path -Path $destinationFile -PathType Leaf)) {
-#            #sync
-#            Copy-Item -Path $file.FullName -Destination $destinationFolder
-#        }
-#    }
-#}
-#
-## Sync files from given folders
-#Sync-Folder -sourceFolder $ZabbixPluginFolder -destinationFolder "$(Split-Path -Path $ConfPath -Parent)\zabbix_agent2.d\"
-#Sync-Folder -sourceFolder $ZabbixScriptsFolder -destinationFolder "$(Split-Path -Path $ConfPath -Parent)\scripts\"
+if ($ConfigurationChanged) {
+    $AgentService = Get-Service -Name "Zabbix Agent2" -ErrorAction SilentlyContinue
+    if ($null -eq $AgentService) {
+        throw "Agent configuration changed, but the Zabbix Agent2 service was not found."
+    }
+    Restart-Service -Name "Zabbix Agent2" -Force -ErrorAction Stop
+}
