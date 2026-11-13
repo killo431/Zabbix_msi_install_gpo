@@ -104,7 +104,13 @@ if (-not $ConfigExists) {
 if ($InstallRequired) {
     $MsiPath = Join-Path -Path $env:TEMP -ChildPath "zabbix_agent2-$ZabbixAgentVersion-windows-amd64-openssl.msi"
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $ZabbixMsiUrl -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop
+    $PreviousProgressPreference = $ProgressPreference
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $ZabbixMsiUrl -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop | Out-Null
+    } finally {
+        $ProgressPreference = $PreviousProgressPreference
+    }
     if (-not (Test-Path -LiteralPath $MsiPath -PathType Leaf) -or (Get-Item -LiteralPath $MsiPath).Length -eq 0) {
         throw "The Zabbix MSI download failed or produced an empty file: $ZabbixMsiUrl"
     }
@@ -129,7 +135,7 @@ if ($InstallRequired) {
     }
 
     $MsiArguments = '/i "{0}" {1} /qn' -f $MsiPath, ($MsiProperties -join ' ')
-    $MsiProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $MsiArguments -Wait -PassThru
+    $MsiProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $MsiArguments -WindowStyle Hidden -Wait -PassThru
     if ($MsiProcess.ExitCode -notin @(0, 3010)) {
         throw "Zabbix Agent 2 MSI installation failed with exit code $($MsiProcess.ExitCode)."
     }
